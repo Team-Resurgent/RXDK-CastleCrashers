@@ -72,6 +72,9 @@ void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint3
 
 // Cycles spent in Direct3D's DrawPrimitiveUP so far (statistics).
 uint64_t draw_call_cycles();
+// DrawPrimitiveUP calls so far: draws with the same state go together
+// (statistics).
+uint32_t draw_calls();
 // Palettes baked so far (statistics).
 uint32_t palettes_baked();
 // Cycles in draw's phases so far: setup, vertices, triangles, state, texture

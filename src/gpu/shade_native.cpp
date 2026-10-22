@@ -191,8 +191,9 @@ void vs_transform3(const GpuState& gpu, const uint32_t* indices, uint32_t count,
     for (uint32_t i = 0; i < count; i++) {
         ShadedVertex& v = out[i];
         clear(v);
-        uint32_t b = s.base(float(indices[i]), kStride);
-        float x = s.f(b), y = s.f(b + 1), z = s.f(b + 2);
+        uint32_t d[kStride];
+        s.read(s.base(float(indices[i]), kStride), kStride, d);  // the vertex at once
+        float x = as_float(d[0]), y = as_float(d[1]), z = as_float(d[2]);
         for (int k = 0; k < 4; k++) {
             float t = mul(1.0f, at(c[3], k));
             t = mul(z, at(c[2], k)) + t;
@@ -200,15 +201,14 @@ void vs_transform3(const GpuState& gpu, const uint32_t* indices, uint32_t count,
             v.position[k] = mul(x, at(c[0], k)) + t;
         }
         for (int n = 0; n < kTexcoords; n++) {
-            v.interpolators[n][0] = s.f(b + 3 + 2 * n);
-            v.interpolators[n][1] = s.f(b + 4 + 2 * n);
+            v.interpolators[n][0] = as_float(d[3 + 2 * n]);
+            v.interpolators[n][1] = as_float(d[4 + 2 * n]);
         }
-        float rgba[4];
-        s.unorm8888(b + 3 + 2 * kTexcoords, rgba);
-        v.interpolators[kTexcoords][0] = rgba[2];
-        v.interpolators[kTexcoords][1] = rgba[1];
-        v.interpolators[kTexcoords][2] = rgba[0];
-        v.interpolators[kTexcoords][3] = rgba[3];
+        uint32_t colour = d[3 + 2 * kTexcoords];  // FMT_8_8_8_8: X the low byte; o = r0.zyxw
+        v.interpolators[kTexcoords][0] = float((colour >> 16) & 0xFF) / 255.0f;
+        v.interpolators[kTexcoords][1] = float((colour >> 8) & 0xFF) / 255.0f;
+        v.interpolators[kTexcoords][2] = float(colour & 0xFF) / 255.0f;
+        v.interpolators[kTexcoords][3] = float(colour >> 24) / 255.0f;
     }
 }
 

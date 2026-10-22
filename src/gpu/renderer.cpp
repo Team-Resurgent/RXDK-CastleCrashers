@@ -34,6 +34,9 @@ IDirect3DDevice8* device;
 
 // After releasing a texture: a new one may get its address (set_texture).
 void forget_textures();
+// Before a texture is released or written: the triangles waiting to be drawn
+// with it are drawn (draw).
+void retire(IDirect3DBaseTexture8* texture);
 
 // Frames presented: cached textures compare their guest data once a frame.
 uint32_t frame_number;
@@ -709,8 +712,10 @@ const Texture* prepared_texture(const TextureKey& key, uint32_t guest, uint32_t 
         texture->UnlockRect(0);
     }
     if (it != textures.end()) {
-        if (it->second.texture)
+        if (it->second.texture) {
+            retire(it->second.texture);
             it->second.texture->Release();
+        }
         forget_textures();
         textures.erase(it);
     }
@@ -749,6 +754,7 @@ const Texture* texture_for(const GpuState& gpu, uint32_t slot, bool red_alpha, f
             return &it->second;
         }
         if (it->second.texture) {
+            retire(it->second.texture);
             it->second.texture->Release();
             forget_textures();
         }
@@ -767,6 +773,7 @@ const Texture* texture_for(const GpuState& gpu, uint32_t slot, bool red_alpha, f
             return &same;
         }
         if (it->second.texture) {
+            retire(it->second.texture);
             it->second.texture->Release();
             forget_textures();
         }
@@ -845,6 +852,7 @@ const Texture* shape_texture_for(const GpuState& gpu, float z) {
             return &it->second;
         }
         if (it->second.texture) {
+            retire(it->second.texture);
             it->second.texture->Release();
             forget_textures();
         }
@@ -1039,6 +1047,7 @@ const Texture* palette_texture_for(const GpuState& gpu, float r1x, float r1y) {
             break;
         }
     if (t.texture) {
+        retire(t.texture);
         D3DLOCKED_RECT locked;
         if (SUCCEEDED(t.texture->LockRect(0, &locked, nullptr, 0))) {
             XGSwizzleRect(out.data(), pot_w * 4, nullptr, locked.pBits, pot_w, pot_h, nullptr, 4);
@@ -1147,6 +1156,8 @@ struct StateCache {
     bool texture_known[D3DTSS_MAXSTAGES] = {};
 } cache;
 
+void flush();
+
 void set_render_state(D3DRENDERSTATETYPE state, DWORD value) {
     if (unsigned(state) < D3DRS_MAX) {
         if (cache.render_known[state] && cache.render[state] == value)
@@ -1154,6 +1165,7 @@ void set_render_state(D3DRENDERSTATETYPE state, DWORD value) {
         cache.render_known[state] = true;
         cache.render[state] = value;
     }
+    flush();
     device->SetRenderState(state, value);
 }
 
@@ -1164,6 +1176,7 @@ void set_stage_state(DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value) {
         cache.stage_known[stage][type] = true;
         cache.stage[stage][type] = value;
     }
+    flush();
     device->SetTextureStageState(stage, type, value);
 }
 
@@ -1179,6 +1192,7 @@ void set_texture(DWORD stage, IDirect3DBaseTexture8* texture) {
         cache.texture_known[stage] = true;
         cache.texture[stage] = texture;
     }
+    flush();
     device->SetTexture(stage, texture);
 }
 
@@ -1258,10 +1272,37 @@ struct Vertex {
 };
 constexpr DWORD kFvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
-// Draws and resolves since the last present.
-uint32_t frame_draws, frame_resolves;
 // Cycles spent in DrawPrimitiveUP (stats: the rest of draw is state).
 uint64_t primitive_cycles;
+uint32_t primitive_calls;
+
+// Triangles with the state set now, not drawn yet: a draw is often a single
+// sprite, and the next one with the same state goes with it into one
+// DrawPrimitiveUP. Drawn before any state changes, before a texture of
+// theirs goes or is written, and at the present.
+std::vector<Vertex> batch;
+constexpr size_t kBatchVertices = 3 * 512;
+// The scissor set (SetScissors), compared before setting it again.
+D3DRECT scissor_set;
+bool scissor_known;
+
+void flush() {
+    if (batch.empty())
+        return;
+    uint64_t t0 = __builtin_ia32_rdtsc();
+    device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, UINT(batch.size() / 3), batch.data(), sizeof(Vertex));
+    primitive_cycles += __builtin_ia32_rdtsc() - t0;
+    primitive_calls++;
+    batch.clear();
+}
+
+void retire(IDirect3DBaseTexture8* texture) {
+    if (texture == cache.texture[0] || texture == cache.texture[1])
+        flush();
+}
+
+// Draws and resolves since the last present.
+uint32_t frame_draws, frame_resolves;
 // Statistics: cycles in draw's phases (setup, vertices, triangles, state,
 // texture lookup, run set-up).
 uint64_t phase_cycles[6], phase_mark;
@@ -1518,8 +1559,12 @@ void draw(const GpuState& gpu, uint32_t primitive, const ShadedVertex* in, uint3
     auto clamp = [](float v, float hi) { return LONG(v < 0 ? 0 : v > hi ? hi : v); };
     D3DRECT scissor = {clamp(float(tl & 0x7FFF) * msaa_x, kWidth), clamp(float((tl >> 16) & 0x7FFF) * msaa_y, kHeight),
                        clamp(float(br & 0x7FFF) * msaa_x, kWidth), clamp(float((br >> 16) & 0x7FFF) * msaa_y, kHeight)};
-    device->SetScissors(1, FALSE, &scissor);
-    device->SetVertexShader(kFvf);
+    if (!scissor_known || memcmp(&scissor, &scissor_set, sizeof(scissor))) {
+        flush();
+        device->SetScissors(1, FALSE, &scissor);
+        scissor_set = scissor;
+        scissor_known = true;
+    }
 
     // What a source vertex selects: the array layer (its z), and for the
     // palette shader the palette offset and tint, for the mask shader the
@@ -1545,7 +1590,6 @@ void draw(const GpuState& gpu, uint32_t primitive, const ShadedVertex* in, uint3
         }
         return s;
     };
-    static std::vector<Vertex> run;
     size_t triangles = source.size();
     for (size_t first = 0; first < triangles;) {
         Selection s = select(source[first]);
@@ -1584,12 +1628,6 @@ void draw(const GpuState& gpu, uint32_t primitive, const ShadedVertex* in, uint3
         phase_mark = __builtin_ia32_rdtsc();
         if (texture)
             const_cast<Texture*>(texture)->used = frame_number;
-        run.assign(tri.begin() + first * 3, tri.begin() + last * 3);
-        if (texture)
-            for (Vertex& vertex : run) {
-                vertex.u *= texture->u_scale;
-                vertex.v *= texture->v_scale;
-            }
         if (texture && texture->texture) {
             set_texture(0, texture->texture);
             // kTexture: the texture alone; kModulate: times the colour (a mask
@@ -1624,23 +1662,31 @@ void draw(const GpuState& gpu, uint32_t primitive, const ShadedVertex* in, uint3
             // only then (-1: fixed function).
             int k = int(lighten * 255.0f + 0.5f);
             if (current_program != k) {
+                flush();
                 D3DPIXELSHADERDEF program = palette_program(lighten);
                 device->SetPixelShaderProgram(&program);
                 current_program = k;
             }
         } else {
             if (current_program != -1) {
+                flush();
                 device->SetPixelShader(0);
                 current_program = -1;
             }
             set_texture(1, nullptr);
             set_stage_state(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
         }
+        // The state is set: the run joins the triangles waiting with it.
+        size_t at = batch.size();
+        batch.insert(batch.end(), tri.begin() + first * 3, tri.begin() + last * 3);
+        if (texture)
+            for (size_t i = at; i < batch.size(); i++) {
+                batch[i].u *= texture->u_scale;
+                batch[i].v *= texture->v_scale;
+            }
+        if (batch.size() >= kBatchVertices)
+            flush();
         phase_cycles[5] += __builtin_ia32_rdtsc() - phase_mark;
-        phase_mark = __builtin_ia32_rdtsc();
-        uint64_t t0 = __builtin_ia32_rdtsc();
-        device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, UINT(run.size() / 3), run.data(), sizeof(Vertex));
-        primitive_cycles += __builtin_ia32_rdtsc() - t0;
         phase_mark = __builtin_ia32_rdtsc();
         first = last;
     }
@@ -1715,6 +1761,8 @@ void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint3
 
 uint64_t draw_call_cycles() { return primitive_cycles; }
 
+uint32_t draw_calls() { return primitive_calls; }
+
 uint32_t palettes_baked() { return palette_bakes; }
 
 const uint64_t* draw_phase_cycles() { return phase_cycles; }
@@ -1722,6 +1770,7 @@ const uint64_t* draw_phase_cycles() { return phase_cycles; }
 void present() {
     if (!device)
         return;
+    flush();
     uint32_t presented = ++frame_number;
     if (presented % 300 == 0) {
         // Textures not drawn with for ten seconds (an earlier level's) go.
@@ -1863,6 +1912,7 @@ void present() {
         front->Release();
     }
     device->SetScissors(0, FALSE, nullptr);  // the whole back buffer
+    scissor_known = false;
     if (clear_pending)
         device->Clear(0, nullptr, D3DCLEAR_TARGET, clear_color, 1.f, 0);
     clear_pending = false;

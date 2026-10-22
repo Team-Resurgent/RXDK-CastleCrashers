@@ -516,9 +516,9 @@ void feed_voice(Voice& v) {
             end_feed(v);  // played out
         return;
     }
-    // The play position is costly to read (the APU's): every 20 ms, well
+    // The play position is costly to read (the APU's): every 40 ms, well
     // within the lead (about 130 ms).
-    if (now - v.checked < 20)
+    if (now - v.checked < 40)
         return;
     v.checked = now;
     for (uint32_t lead = voice_lead(v); lead < kLeadFrames && more(); lead++)

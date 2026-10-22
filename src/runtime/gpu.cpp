@@ -619,12 +619,16 @@ DWORD WINAPI gpu_thread(void*) {
                 // The CPU's time: idle, then this thread's: vertex shading,
                 // NV2A submission, the rest of the packets (mostly waits).
                 unsigned seconds = kStatsMs / 1000;
-                log("gpu: %u fps, %u draws/s, %u indices/s; idle %u%%, GPU thread %u%% (shading %u, submitting %u, "
+                static uint32_t last_calls;
+                uint32_t calls = gpu::renderer::draw_calls();
+                log("gpu: %u fps, %u draws/s (%u NV2A), %u indices/s; idle %u%%, GPU thread %u%% (shading %u, submitting %u, "
                     "packets %u), %u wait sleeps/s\n",
-                    (frames - last_frames) / seconds, draws / seconds, indices / seconds,
+                    (frames - last_frames) / seconds, draws / seconds, (calls - last_calls) / seconds,
+                    indices / seconds,
                     unsigned((idle - last_idle) * 100 / elapsed), unsigned(busy_cycles * 100 / elapsed),
                     unsigned(shade_cycles * 100 / elapsed), unsigned(submit_cycles * 100 / elapsed),
                     unsigned((busy_cycles - shade_cycles - submit_cycles) * 100 / elapsed), waits / seconds);
+                last_calls = calls;
             }
             waits = 0;
             last_idle = idle;
