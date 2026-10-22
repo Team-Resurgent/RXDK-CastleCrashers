@@ -485,6 +485,9 @@ void feed_frame(Voice& v) {
     if (++f.next >= f.loop_end && f.loop_end) {
         f.next = f.loop_start;
         f.wraps++;
+        static int said;
+        if (f.bank == &banks[1] && said++ < 30)
+            log("xma: music loops back to frame %u\n", f.loop_start);
     }
 }
 
@@ -638,6 +641,16 @@ void start_feed(Context& c, const ContextData& data, uint32_t buffer, const Pack
     }
     v.last_taken = GetTickCount();
     c.wraps_seen = f.wraps;
+    // Diagnostic: the music's voices, whether they loop on their own.
+    static int said;
+    if (p.bank == &banks[1] && said++ < 60) {
+        const char* name = "?";
+        for (const auto& [n, i] : p.bank->by_name)
+            if (&p.bank->entries[i] == p.entry)
+                name = n.c_str();
+        log("xma: music %s from frame %u of %u; loop count %u, bits %u-%u, frames %u-%u\n", name, p.first_frame,
+            p.entry->frames, data.loop_count, data.loop_start, data.loop_end, f.loop_start, f.loop_end);
+    }
 }
 
 // Starts the next frame: of the current packet while it has frames, else of

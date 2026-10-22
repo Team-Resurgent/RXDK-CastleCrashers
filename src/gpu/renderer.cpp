@@ -18,6 +18,12 @@ void log(const char* format, ...);
 // The physical address of the frame on screen (present).
 extern "C" volatile DWORD renderer_front_buffer = 0;
 
+namespace title {
+// runtime/title.cpp: whether the texture at guest is a job the title's
+// worker kept unrasterized, now rasterized (prepare_texels).
+bool raster_on_demand(uint32_t guest);
+}  // namespace title
+
 namespace gpu {
 namespace {
 
@@ -132,6 +138,8 @@ struct Prepared {
     // taken it.
     std::vector<uint8_t> dxt5;
     uint32_t width, height, sequence;
+    uint32_t tag = 0;     // prepare_texels's, for the statistics
+    bool taken = false;   // drawn at least once
 };
 // Statistics: DXT5 bytes prepared, and as compressed; textures compressed
 // back when idle (present).
@@ -666,6 +674,15 @@ void swap_dxt_red_blue(Image& image) {
 // The texture for key from the prepared texture at guest, if there is one
 // of this size: made once per preparation (a newer one replaces it).
 const Texture* prepared_texture(const TextureKey& key, uint32_t guest, uint32_t width, uint32_t height) {
+    // None yet: a job the title's worker kept is rasterized now
+    // (runtime/title.cpp), the first time it is drawn.
+    bool known;
+    {
+        PreparedLock held;
+        known = prepared.count(guest) != 0;
+    }
+    if (!known && !title::raster_on_demand(guest))
+        return nullptr;
     PreparedLock held;
     auto p = prepared.find(guest);
     if (p == prepared.end() || p->second.width != width || p->second.height != height)
@@ -705,6 +722,7 @@ const Texture* prepared_texture(const TextureKey& key, uint32_t guest, uint32_t 
     t.released = true;
     t.prepared = p->second.sequence;
     std::vector<uint8_t>().swap(p->second.dxt5);
+    p->second.taken = true;
     return &(textures[key] = t);
 }
 
@@ -1666,7 +1684,7 @@ void prepare_texture(uint32_t guest, uint32_t width, uint32_t height) {
     prepare_texels(guest, width, height, texels.data());
 }
 
-void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint32_t* texels) {
+void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint32_t* texels, uint32_t tag) {
     if (width < 4 || height < 4 || (width & (width - 1)) || (height & (height - 1)))
         return;
     // The blocks in row order, then compressed (Prepared).
@@ -1691,6 +1709,8 @@ void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint3
     p.width = width;
     p.height = height;
     p.sequence = ++prepared_sequence;
+    p.tag = tag;
+    p.taken = false;
 }
 
 uint64_t draw_call_cycles() { return primitive_cycles; }
@@ -1781,17 +1801,26 @@ void present() {
             if (t.texture && SUCCEEDED(t.texture->GetLevelDesc(0, &desc)))
                 d3d_bytes += desc.Size;
         }
+        uint32_t tag_taken[16] = {}, tag_all[16] = {};
         {
             PreparedLock held;
             for (auto& [address, p] : prepared) {
                 waiting += !p.dxt5.empty();
                 waiting_bytes += uint32_t(p.dxt5.size());
+                tag_all[p.tag & 15]++;
+                tag_taken[p.tag & 15] += p.taken;
             }
         }
         log("renderer: %u textures (%u KB), %u released (%u KB of guest memory); %u prepared waiting (%u KB); "
             "prepared so far %u KB as %u KB; %u compacted when idle\n",
             unsigned(textures.size()), d3d_bytes >> 10, kept, kept_bytes >> 10, waiting, waiting_bytes >> 10,
             unsigned(prepared_raw_bytes >> 10), unsigned(prepared_packed_bytes >> 10), textures_compacted);
+        char line[256];
+        int n = snprintf(line, sizeof(line), "renderer: prepared drawn/all by tag:");
+        for (int i = 0; i < 16; i++)
+            if (tag_all[i])
+                n += snprintf(line + n, sizeof(line) - n, " %d:%u/%u", i, tag_taken[i], tag_all[i]);
+        log("%s\n", line);
     }
     if (presented % 1800 == 1) {
         // The caches' textures and their memory (level 0, power-of-two).

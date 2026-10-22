@@ -15,6 +15,8 @@
 #include <climits>
 #include <cmath>
 
+#include <map>
+#include <string>
 #include <vector>
 
 extern "C" PPC_FUNC(__imp__sub_820D4250);
@@ -40,7 +42,7 @@ uint32_t jobs;
         if (slot == kJob)                                    \
             job_end = t1;                                    \
     }
-TIMED(sub_820D6258, kJob)
+extern "C" PPC_FUNC(__imp__sub_820D6258);  // timed in sub_820D6258 (below)
 
 namespace {
 
@@ -506,49 +508,316 @@ PPC_FUNC(sub_820D5220) {
          });
 }
 
+namespace io {
+std::string last_pack_name();  // io.cpp
+}  // namespace io
+
+namespace {
+// The pack being loaded, as a small number for the renderer's statistics
+// (prepare_texels's tag): which packs' art gets drawn.
+uint32_t pack_tag() {
+    static std::vector<std::string> packs;
+    std::string name = io::last_pack_name();
+    for (uint32_t i = 0; i < packs.size(); i++)
+        if (packs[i] == name)
+            return i;
+    if (packs.size() >= 15)
+        return 15;
+    packs.push_back(name);
+    log("raster: tag %u is %s\n", unsigned(packs.size() - 1), name.c_str());
+    return uint32_t(packs.size() - 1);
+}
+}  // namespace
+
+// --- rasterizing on demand ----------------------------------------------------
+//
+// At load the title rasterizes every shape of a pack at every size it may
+// need, and most are never drawn (of the shared packs' few thousand, a few
+// dozen in a level). A job of those packs is not rasterized: the worker
+// keeps a copy of it, and rasterizes it from that when the renderer first
+// draws its texture (raster_on_demand), between jobs or when idle. The
+// worker does it because a rasterization takes from the worker's own heap,
+// which is not for other threads. The level's packs are rasterized at load
+// as before: a level's art is nearly all drawn, and at once.
+constexpr bool kDeferRaster = true;
+const char* const kDeferredPacks[] = {"FX.PAK", "PLAYER.PAK", "MAIN.PAK", "ANIMALS.PAK", "PAUSE.PAK"};
+// A job (sub_8207D190 fills it in): its inputs at +4 and +572, its size at
+// +552 and +556, its texture at +564 and raster at +568.
+constexpr uint32_t kJobBytes = 688;
+// The first eligible jobs are rasterized at load and again from the copy,
+// compared: the copy must give the same texture.
+constexpr uint32_t kDeferChecks = 40;
+
+namespace {
+
+struct Pending {
+    std::vector<uint8_t> job;
+    uint32_t width, height, tag;
+};
+std::map<uint32_t, Pending> pending;  // by texture address
+CRITICAL_SECTION pending_lock;
+HANDLE request_event, done_event;
+uint32_t requested;    // the texture the renderer waits for (0: none)
+bool request_done;     // whether it was rasterized
+uint32_t deferred_job;  // the job the worker just kept rather than rasterized
+uint32_t checked_job;   // the job rasterized both ways
+std::vector<uint8_t> checked_copy;
+uint32_t deferred, on_demand, defer_checks, defer_mismatches, on_demand_timeouts, on_demand_stale;  // statistics
+uint64_t on_demand_cycles;
+
+struct PendingInit {
+    PendingInit() {
+        InitializeCriticalSection(&pending_lock);
+        request_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        done_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    }
+} pending_init;
+
+bool power_of_two_size(uint32_t width, uint32_t height) {
+    return width >= 4 && height >= 4 && !(width & (width - 1)) && !(height & (height - 1));
+}
+
+bool deferred_pack() {
+    std::string pack = io::last_pack_name();
+    for (const char* name : kDeferredPacks)
+        if (_stricmp(pack.c_str(), name) == 0)
+            return true;
+    return false;
+}
+
+// A job's raster: its pages past the first kKeptRaster go back, but the
+// last (the arena keeps its block headers there). The next raster, at the
+// same place and cleared whole with memset, would fault each page back in,
+// which costs more than the clear; most rasters fit in the part kept.
+void release_raster(uint32_t raster, uint32_t width, uint32_t height) {
+    constexpr uint32_t kKeptRaster = 1 << 20;
+    uint32_t bytes = width * height * 16;
+    if (bytes > kKeptRaster + guest::kPage)
+        guest::release(raster + kKeptRaster, bytes - kKeptRaster - guest::kPage);
+}
+
+// A job rasterized from a copy of it, on the worker (ctx its context), as
+// the worker's loop (820D4030) does it: a raster from its heap, cleared, the
+// raster's description (820D4968), the job (820D6258), then both freed.
+bool raster_copy(PPCContext& ctx, PPCBase base, const std::vector<uint8_t>& copy, uint32_t width, uint32_t height,
+                 std::vector<uint32_t>& texels) {
+    static uint32_t job = guest::alloc(guest::kPage), description = guest::alloc(guest::kPage);
+    PPCContext saved = ctx;
+    memcpy(guest::host(job), copy.data(), kJobBytes);
+    uint32_t cpu = guest::load8(ctx.r13.u32 + 268);  // the heap of the processor it is on (820DAA48)
+    uint32_t heap = guest::load32(0x822DBD10 + cpu * 4), bytes = width * height * 16;
+    auto call = [&](uint32_t function, uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6) {
+        ctx.r1.u64 = saved.r1.u32 - 256;
+        ctx.r3.u64 = r3;
+        ctx.r4.u64 = r4;
+        ctx.r5.u64 = r5;
+        ctx.r6.u64 = r6;
+        guest::call(ctx, function);
+        return ctx.r3.u32;
+    };
+    uint32_t raster = call(0x820BD8D8, heap, bytes, 0, 0);
+    if (!raster) {
+        ctx = saved;
+        return false;
+    }
+    memset(guest::host(raster), 0, bytes);
+    // As the worker's loop leaves the description before 820D4968: its
+    // vtable (the spans' dispatch, 820D4EA8's) and +28 to +40 cleared.
+    memset(guest::host(description), 0, 64);
+    guest::store32(description, 0x8205C8FC);
+    call(0x820D4968, description, raster, width, height * 2);
+    ctx.r1.u64 = saved.r1.u32 - 256;
+    ctx.r3.u64 = job + 4;
+    ctx.r4.u64 = description;
+    ctx.r5.u64 = job + 572;
+    __imp__sub_820D6258(ctx, base);
+    pack_raster(raster, width * height, texels);
+    call(0x820BDA18, heap, raster, 0, 0);
+    call(0x820D4A90, description, 0, 0, 0);
+    release_raster(raster, width, height);
+    ctx = saved;
+    return true;
+}
+
+// The renderer's request, if there is one: the texture rasterized now.
+void serve_request(PPCContext& ctx, PPCBase base) {
+    EnterCriticalSection(&pending_lock);
+    uint32_t texture = requested;
+    Pending job;
+    auto it = texture ? pending.find(texture) : pending.end();
+    if (it != pending.end()) {
+        job = std::move(it->second);
+        pending.erase(it);
+    }
+    LeaveCriticalSection(&pending_lock);
+    if (!texture)
+        return;
+    bool done = false;
+    std::vector<uint32_t> texels;
+    // Not written since it was kept: the title has not put something else
+    // there. (Only whole pages are told apart: a small texture's or the
+    // ends of an unaligned one's never are, and those count as untouched.)
+    if (job.job.empty() || guest::released_state(texture, job.width * job.height * 4) == guest::Released::kTouched) {
+        on_demand_stale++;
+    } else if (raster_copy(ctx, base, job.job, job.width, job.height, texels)) {
+        gpu::renderer::prepare_texels(texture, job.width, job.height, texels.data(), job.tag);
+        done = true;
+    }
+    static int said;
+    if (said++ < 40)
+        log("raster: on demand %08X %ux%u (tag %u): %s\n", texture, job.width, job.height, job.tag,
+            done ? "rasterized" : job.job.empty() ? "not kept" : "stale or failed");
+    EnterCriticalSection(&pending_lock);
+    requested = 0;
+    request_done = done;
+    LeaveCriticalSection(&pending_lock);
+    SetEvent(done_event);
+}
+
+}  // namespace
+
+namespace title {
+// From the renderer, before it draws a texture it has no prepared copy of:
+// whether it is a kept job's, now rasterized (prepare_texels). Waits for
+// the worker, which takes the request between jobs or when idle.
+bool raster_on_demand(uint32_t texture) {
+    EnterCriticalSection(&pending_lock);
+    bool kept = pending.count(texture) != 0;
+    if (kept) {
+        requested = texture;
+        request_done = false;
+    }
+    LeaveCriticalSection(&pending_lock);
+    if (!kept)
+        return false;
+    uint64_t t0 = __builtin_ia32_rdtsc();
+    SetEvent(request_event);
+    bool done = WaitForSingleObject(done_event, 3000) == WAIT_OBJECT_0;
+    EnterCriticalSection(&pending_lock);
+    done = done && request_done;
+    if (requested == texture) {  // timed out: the worker did not get to it
+        requested = 0;
+        on_demand_timeouts++;
+    }
+    LeaveCriticalSection(&pending_lock);
+    on_demand_cycles += __builtin_ia32_rdtsc() - t0;
+    on_demand += done;
+    return done;
+}
+}  // namespace title
+
+// The worker's job (r3 the job + 4, r4 the raster's description, r5 the
+// job + 572): one of a deferred pack's is kept, not rasterized (the
+// worker's loop goes on: cc_raster_done sees it).
+PPC_FUNC(sub_820D6258) {
+    uint32_t job = ctx.r3.u32 - 4;
+    uint32_t width = guest::load32(job + 552), height = guest::load32(job + 556);
+    if (kDeferRaster && power_of_two_size(width, height) && deferred_pack()) {
+        std::vector<uint8_t> copy(guest::host(job), guest::host(job) + kJobBytes);
+        if (defer_checks < kDeferChecks) {
+            checked_job = job;
+            checked_copy = std::move(copy);
+        } else {
+            deferred_job = job;
+            checked_copy = std::move(copy);  // taken by cc_raster_done
+            return;
+        }
+    }
+    uint64_t t0 = __builtin_ia32_rdtsc();
+    __imp__sub_820D6258(ctx, base);
+    job_end = __builtin_ia32_rdtsc();
+    timed_cycles[kJob] += job_end - t0;
+    timed_calls[kJob]++;
+}
+
+// A short sleep (r3 ms): the worker's when it has no job. It takes the
+// renderer's requests meanwhile.
+extern "C" PPC_FUNC(__imp__sub_820DA7A8);
+PPC_FUNC(sub_820DA7A8) {
+    GuestThread* t = current_thread();
+    if (!t || t->start != 0x820D4030) {
+        __imp__sub_820DA7A8(ctx, base);
+        return;
+    }
+    serve_request(ctx, base);
+    WaitForSingleObject(request_event, ctx.r3.u32);
+    serve_request(ctx, base);
+    static DWORD logged;
+    if (GetTickCount() - logged > 10000) {
+        logged = GetTickCount();
+        EnterCriticalSection(&pending_lock);
+        uint32_t kept = uint32_t(pending.size());
+        LeaveCriticalSection(&pending_lock);
+        log("raster: %u jobs kept (%u still), %u rasterized on demand (%u ms waited, %u timed out, %u stale)\n",
+            deferred, kept, on_demand, unsigned(on_demand_cycles / 733000), on_demand_timeouts, on_demand_stale);
+    }
+}
+
 // A worker has drawn a job's shape into its texture (tools/postprocess.py
 // calls this from 820D4030, so with C linkage): job +564 the texels, +552 by
-// +556 of them.
+// +556 of them. Or it kept the job (sub_820D6258): the texture is pending.
 extern "C" void cc_raster_done(PPCContext& ctx, uint32_t job) {
-    (void)ctx;
+    job_end = job_end ? job_end : __builtin_ia32_rdtsc();
     struct PackTime {
         ~PackTime() {
             timed_cycles[kPack] += __builtin_ia32_rdtsc() - job_end;
             timed_calls[kPack]++;
+            job_end = 0;
         }
     } pack_time;
     if (++jobs % 100 == 0) {
         for (int i = 0; i < kTimed; i++)
             log("raster: %-16s %6u ms, %u calls\n", kTimedNames[i], unsigned(timed_cycles[i] / 733000),
                 unsigned(timed_calls[i]));
-        log("raster: %u K texels packed\n", unsigned(texels_packed >> 10));
+        log("raster: %u K texels packed; %u jobs kept, %u rasterized on demand (%u ms waited, %u timed out); "
+            "%u of %u checks differ\n",
+            unsigned(texels_packed >> 10), deferred, on_demand, unsigned(on_demand_cycles / 733000),
+            on_demand_timeouts, defer_mismatches, defer_checks);
     }
     uint32_t width = guest::load32(job + 552), height = guest::load32(job + 556);
-    uint32_t texture = guest::load32(job + 564);
+    uint32_t texture = guest::load32(job + 564), raster = guest::load32(job + 568);
+    if (job == deferred_job) {
+        deferred_job = 0;
+        deferred++;
+        // Its memory goes until it is rasterized (or for good).
+        guest::release(texture, width * height * 4);
+        release_raster(raster, width, height);
+        EnterCriticalSection(&pending_lock);
+        pending[texture] = Pending{std::move(checked_copy), width, height, pack_tag()};
+        LeaveCriticalSection(&pending_lock);
+        serve_request(ctx, guest::base);
+        return;
+    }
     // The worker's pack loop does not run (tools/postprocess.py): packed
     // here, the same to the bit, straight for the renderer.
     std::vector<uint32_t> texels;
     uint64_t t0 = __builtin_ia32_rdtsc();
-    pack_raster(guest::load32(job + 568), width * height, texels);
+    pack_raster(raster, width * height, texels);
     timed_cycles[kNativePack] += __builtin_ia32_rdtsc() - t0;
     timed_calls[kNativePack]++;
     texels_packed += width * height;
-    bool power_of_two = width >= 4 && height >= 4 && !(width & (width - 1)) && !(height & (height - 1));
-    if (power_of_two) {
-        gpu::renderer::prepare_texels(texture, width, height, texels.data());
+    release_raster(raster, width, height);
+    if (job == checked_job) {
+        // The same job from the copy: the same texels.
+        checked_job = 0;
+        std::vector<uint32_t> again;
+        bool ran = raster_copy(ctx, guest::base, checked_copy, width, height, again);
+        defer_checks++;
+        if (!ran || again != texels) {
+            if (defer_mismatches++ < 10)
+                log("raster: job %08X (%ux%u) from its copy %s\n", job, width, height,
+                    ran ? "differs" : "did not run");
+        }
+        if (defer_checks == kDeferChecks)
+            log("raster: deferring checked, %u of %u differ\n", defer_mismatches, defer_checks);
+    }
+    if (power_of_two_size(width, height)) {
+        gpu::renderer::prepare_texels(texture, width, height, texels.data(), pack_tag());
     } else {
         for (uint32_t i = 0; i < width * height; i++)  // as the worker would have
             guest::store32(texture + i * 4, texels[i]);
     }
-    // The job's raster (+568, 16 bytes a texel: four floats) is freed next.
-    // Its pages past the first kKeptRaster go back now, but the last (the
-    // arena keeps its block headers there): the next job's raster, at the
-    // same place and cleared whole with memset, would fault each page back
-    // in, which costs more than the clear. Most rasters fit in the part kept.
-    constexpr uint32_t kKeptRaster = 1 << 20;
-    uint32_t raster = guest::load32(job + 568), bytes = width * height * 16;
-    if (bytes > kKeptRaster + guest::kPage)
-        guest::release(raster + kKeptRaster, bytes - kKeptRaster - guest::kPage);
+    serve_request(ctx, guest::base);
 }
 
 // The C library's memset (r3, the byte r4, r5 bytes; returns r3), native:

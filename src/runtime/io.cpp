@@ -23,6 +23,7 @@ namespace {
 std::set<HANDLE> directories;
 std::map<HANDLE, std::string> file_paths;  // for the log (a reused handle gets its new path)
 std::map<HANDLE, HANDLE> listings;          // a directory's kernel handle, for NtQueryDirectoryFile
+std::string last_pack;                      // the pack (GAME\*.PAK) the title opened last
 CRITICAL_SECTION directories_lock;
 struct Init {
     Init() { InitializeCriticalSection(&directories_lock); }
@@ -155,6 +156,12 @@ void open(PPCContext& ctx, uint32_t disposition, uint32_t options) {
     LeaveCriticalSection(&directories_lock);
     if (first || kernel::trace_imports)
         log("io: open %s (%lu bytes)\n", path.c_str(), GetFileSize(h, nullptr));
+    if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".pak") == 0) {
+        size_t slash = path.find_last_of('\\');
+        EnterCriticalSection(&directories_lock);
+        last_pack = path.substr(slash == std::string::npos ? 0 : slash + 1);
+        LeaveCriticalSection(&directories_lock);
+    }
     guest::store32(ctx.r3.u32, kernel::add_handle(h));
     io_status(ctx.r6.u32, kSuccess, exists ? 1 : 2);  // FILE_OPENED / FILE_CREATED
     ctx.r3.u64 = kSuccess;
@@ -461,3 +468,13 @@ IMPORT(NtQueryVolumeInformationFile) {
     }
     ctx.r3.u64 = kSuccess;
 }
+
+namespace io {
+// The pack (GAME\*.PAK) the title opened last.
+std::string last_pack_name() {
+    EnterCriticalSection(&directories_lock);
+    std::string name = last_pack;
+    LeaveCriticalSection(&directories_lock);
+    return name;
+}
+}  // namespace io
