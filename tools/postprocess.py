@@ -10,8 +10,11 @@ emulated byte by byte; ppc_bswap128 does the same with four bswaps.
 A jump table (switch) takes its index's low 32 bits, as the guest's cmplwi
 bounds it, and an index past its cases reports the switch (ppc_bad_switch)
 instead of reaching __builtin_unreachable(): a table found with too few
-cases would jump anywhere. Files are rewritten in place, and only when they
-change.
+cases would jump anywhere.
+
+PATCHES change the title itself for the original Xbox: each replaces one
+exact line in one function, and the build fails if the line is not there.
+Files are rewritten in place, and only when they change.
 """
 from __future__ import annotations
 
@@ -19,7 +22,11 @@ import re
 import sys
 from pathlib import Path
 
-SWITCH = re.compile(r"\tswitch \(ctx\.(r\d+)\.u64\) \{\n\tcase 0:\n\t\tgoto loc_([0-9A-F]+);")
+# (function, generated line, replacement, why)
+PATCHES: list[tuple[str, str, str, str]] = [
+]
+
+SWITCH =re.compile(r"\tswitch \(ctx\.(r\d+)\.u64\) \{\n\tcase 0:\n\t\tgoto loc_([0-9A-F]+);")
 UNREACHABLE = "\tdefault:\n\t\t__builtin_unreachable();"
 
 
@@ -74,17 +81,38 @@ def rewrite(text: str) -> tuple[str, int]:
     return "".join(out), count
 
 
+def apply_patches(text: str, applied: set[int]) -> str:
+    for i, (function, old, new, _) in enumerate(PATCHES):
+        start = text.find(f"PPC_FUNC_IMPL(__imp__{function}) {{")
+        if start == -1:
+            continue
+        end = text.index("\n}\n", start)
+        body = text[start:end]
+        if body.count(old) == 1:
+            text = text[:start] + body.replace(old, new) + text[end:]
+        elif body.count(new) != 1:  # already patched: an earlier run
+            raise SystemExit(f"postprocess: {function} has no single line {old!r}")
+        applied.add(i)
+    return text
+
+
 def main() -> int:
     total = switches = 0
+    applied: set[int] = set()
     for path in sorted(Path(sys.argv[1]).glob("ppc_recomp.*.cpp")):
         text = path.read_text()
         new, count = rewrite(text)
         new, n = rewrite_switches(new)
+        new = apply_patches(new, applied)
         if new != text:
             path.write_text(new)
         total += count
         switches += n
-    print(f"postprocess: {total} byte-reversing shuffles -> ppc_bswap128, {switches} switches checked")
+    missing = [PATCHES[i][0] for i in range(len(PATCHES)) if i not in applied]
+    if missing:
+        raise SystemExit(f"postprocess: no function {', '.join(missing)} to patch")
+    print(f"postprocess: {total} byte-reversing shuffles -> ppc_bswap128, {switches} switches checked, "
+          f"{len(PATCHES)} patches")
     return 0
 
 

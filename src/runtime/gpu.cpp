@@ -221,9 +221,14 @@ void capture_draw(uint32_t opcode, uint32_t initiator, uint32_t index_base, uint
             log("draw: %s c%u = %g %g %g %g\n", base == 0x4000 ? "vs" : "ps", c, v[0], v[1], v[2], v[3]);
         }
     }
-    // The first vertices of vertex fetch constant 0 (address bits 2-31).
+    // The first vertices of vertex fetch constant 0 (address bits 2-31), when
+    // it is one (type 3; a texture's is 2) and its memory is there.
     uint32_t vf = reg(0x4800);
     uint32_t vertices = translate(vf & ~3u);
+    uint32_t start, size;
+    bool committed = false;
+    if ((vf & 3) != 3 || !guest::query(vertices, start, size, committed) || !committed)
+        return;
     n = snprintf(line, sizeof(line), "draw: vf0 data %08X:", vertices);
     for (uint32_t k = 0; k < 16; k++)
         n += snprintf(line + n, sizeof(line) - n, " %08X", guest::load32(vertices + k * 4));

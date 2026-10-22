@@ -13,6 +13,9 @@
 
 void log(const char* format, ...);
 
+// The physical address of the frame on screen (present).
+extern "C" volatile DWORD renderer_front_buffer = 0;
+
 namespace gpu {
 namespace {
 
@@ -911,7 +914,8 @@ void apply_state(const GpuState& gpu) {
 // constant 0, coordinates from an interpolator).
 enum class Mode {
     kModulate,  // texture * colour
-    kMask,      // colour.alpha == 0: the texture; else colour with alpha texture.red * colour.alpha
+    kOpaque,    // texture * colour, the texture's alpha 1
+    kMask,     // colour.alpha == 0: the texture; else colour with alpha texture.red * colour.alpha
     kTexture,   // the texture alone
     kPalette,   // the palette shader: an NV2A program (palette_program)
 };
@@ -925,6 +929,9 @@ struct PixelShader {
 
 const PixelShader kPixelShaders[] = {
     {0x8A78BDFF, 0, -1, Mode::kModulate},  // Direct3D's clear: oC0 = r0
+    {0x6A78BDFF, 0, -1, Mode::kModulate},  // the same as Castle Crashers builds it: oC0 = max(r0, r0)
+    {0x092B5AA3, 1, 0, Mode::kModulate},   // oC0 = tfetch2D(tf0, r0.xy) * r1
+    {0xBC82D314, 1, 0, Mode::kOpaque},     // oC0 = tfetch2D(tf0, r0.xy).xyz1 * r1
     {0x33E1A369, 1, 0, Mode::kModulate},   // sprites: oC0 = tfetch3D(tf0, r0.xyz) * r1
     {0x81DBCACE, 1, 0, Mode::kMask},       // text and images: oC0 = r1.w == 0 ? tfetch2D(tf0, r0.xy)
                                            //   : (r1.xyz, tfetch2D(tf0, r0.xy).x * r1.w)
@@ -947,6 +954,8 @@ struct Vertex {
 };
 constexpr DWORD kFvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
+// Draws and resolves since the last present.
+uint32_t frame_draws, frame_resolves;
 // Cycles spent in DrawPrimitiveUP (stats: the rest of draw is state).
 uint64_t primitive_cycles;
 // Statistics: cycles in draw's phases (setup, vertices, triangles, state,
@@ -997,6 +1006,7 @@ void draw(const GpuState& gpu, uint32_t primitive, const ShadedVertex* in, uint3
     phase_mark = __builtin_ia32_rdtsc();
     if (!device || !count)
         return;
+    frame_draws++;
     const PixelShader* ps = pixel_shader(ps_hash);
     if (!ps) {
         static uint32_t said[16];
@@ -1284,7 +1294,7 @@ void draw(const GpuState& gpu, uint32_t primitive, const ShadedVertex* in, uint3
             set_stage_state(0, D3DTSS_COLOROP, op);
             set_stage_state(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
             set_stage_state(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-            set_stage_state(0, D3DTSS_ALPHAOP, op);
+            set_stage_state(0, D3DTSS_ALPHAOP, mode == Mode::kOpaque ? D3DTOP_SELECTARG2 : op);
             set_stage_state(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
             set_stage_state(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
             set_stage_state(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
@@ -1339,6 +1349,7 @@ D3DCOLOR clear_color;
 
 void resolve(const GpuState& gpu) {
     uint32_t copy = gpu.reg(kRbCopyControl);
+    frame_resolves++;
     {
         // Diagnostic: each resolve destination once.
         static std::map<uint64_t, bool> seen;
@@ -1410,7 +1421,21 @@ void present() {
     }
     debug_frame = presented % 600 == 0 || debug_requested;
     debug_requested = false;
+    // A swap with nothing drawn or resolved since the last shows the same
+    // front buffer again (the title draws a still screen once): flipping
+    // would show the other, stale buffer every other frame.
+    bool changed = frame_draws || frame_resolves;
+    frame_draws = frame_resolves = 0;
+    if (!changed)
+        return;
     device->Present(nullptr, nullptr, nullptr, nullptr);
+    // Where the shown frame is in physical memory: a test can save it off
+    // the console (its address is renderer_front_buffer's symbol).
+    D3DSurface* front = nullptr;
+    if (SUCCEEDED(device->GetBackBuffer(-1, D3DBACKBUFFER_TYPE_MONO, &front)) && front) {
+        renderer_front_buffer = front->Data;
+        front->Release();
+    }
     device->SetScissors(0, FALSE, nullptr);  // the whole back buffer
     if (clear_pending)
         device->Clear(0, nullptr, D3DCLEAR_TARGET, clear_color, 1.f, 0);

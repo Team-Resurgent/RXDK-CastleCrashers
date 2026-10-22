@@ -311,9 +311,11 @@ void init(uint32_t image_header) {
     cert_monitor_data = var(0x40);
     vd_global_device = var(4);
     vd_global_xam_device = var(4);
-    // XboxHardwareInfo: flags, then the number of hardware threads (Xenia's).
+    // XboxHardwareInfo: flags, then the number of hardware threads. Castle
+    // Crashers starts a worker, each with its own 6 MB heap, per hardware
+    // thread but one: two here (the original Xbox has one processor).
     hardware_info = var(16);
-    guest::store8(hardware_info + 4, 6);
+    guest::store8(hardware_info + 4, 2);
     vd_gpu_clock = var(4);
     guest::store32(vd_gpu_clock, 500);
     vd_hsio_lock = var(0x20);
@@ -683,6 +685,22 @@ IMPORT(KeInitializeSemaphore) {
     bind(s, h);
 }
 
+IMPORT(NtCreateSemaphore) {
+    // (handle*, object attributes*, initial count, limit)
+    HANDLE h = CreateSemaphore(nullptr, ctx.r5.s32, ctx.r6.s32, nullptr);
+    guest::store32(ctx.r3.u32, add_handle(h));
+    ctx.r3.u64 = h ? kSuccess : kNoMemory;
+}
+
+IMPORT(NtReleaseSemaphore) {
+    // (handle, count, previous count*)
+    LONG previous = 0;
+    bool released = ReleaseSemaphore(host_handle(ctx.r3.u32), ctx.r4.s32, &previous);
+    if (ctx.r5.u32)
+        guest::store32(ctx.r5.u32, uint32_t(previous));
+    ctx.r3.u64 = released ? kSuccess : 0xC0000047;  // STATUS_SEMAPHORE_LIMIT_EXCEEDED
+}
+
 IMPORT(KeReleaseSemaphore) {
     // (semaphore, increment, adjustment, wait)
     LONG previous = 0;
@@ -816,6 +834,8 @@ IMPORT(ObDeleteSymbolicLink) { ctx.r3.u64 = kSuccess; }
 // --- memory ------------------------------------------------------------------------
 
 IMPORT(ExAllocatePoolWithTag) { ctx.r3.u64 = guest::alloc(ctx.r3.u32); }
+// (size, tag, pool type)
+IMPORT(ExAllocatePoolTypeWithTag) { ctx.r3.u64 = guest::alloc(ctx.r3.u32); }
 IMPORT(ExFreePool) { guest::free(ctx.r3.u32); }
 
 IMPORT(NtAllocateVirtualMemory) {
@@ -843,8 +863,10 @@ IMPORT(NtAllocateVirtualMemory) {
             end = start + block;
         size = end - address;
     }
-    if ((type & 0x1000) && size >= 0x40000)
+    if ((type & 0x1000) && size >= 0x40000) {
         log("kernel: commit %u KB at %08X (%u KB committed before)\n", size >> 10, address, guest::committed_bytes() >> 10);
+        dump_calls(current_thread(), 12);
+    }
     if ((type & 0x1000) && !guest::commit(address, size)) {  // MEM_COMMIT
         log("kernel: cannot commit %u KB at %08X (%u KB committed)\n", size >> 10, address,
             guest::committed_bytes() >> 10);
@@ -894,8 +916,10 @@ IMPORT(NtQueryVirtualMemory) {
 IMPORT(MmAllocatePhysicalMemoryEx) {
     // (flags, size, protect, min address, max address, alignment)
     uint32_t align = ctx.r8.u32 > guest::kPage ? ctx.r8.u32 : guest::kPage;
-    if (ctx.r4.u32 >= 0x40000)
+    if (ctx.r4.u32 >= 0x40000) {
         log("kernel: physical %u KB (%u KB committed before)\n", ctx.r4.u32 >> 10, guest::committed_bytes() >> 10);
+        dump_calls(current_thread(), 12);
+    }
     ctx.r3.u64 = guest::alloc(ctx.r4.u32, align);
     if (!ctx.r3.u32)
         log("kernel: no physical memory for %u KB (%u KB committed)\n", ctx.r4.u32 >> 10, guest::committed_bytes() >> 10);

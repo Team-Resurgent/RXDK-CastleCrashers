@@ -158,7 +158,14 @@ DWORD WINAPI client_thread(void* parameter) {
             uint64_t t0 = __builtin_ia32_rdtsc();
             uint32_t submitted = c.submitted;
             guest::call(ctx, c.callback);
-            mix_cycles += __builtin_ia32_rdtsc() - t0;
+            uint64_t mixed = __builtin_ia32_rdtsc() - t0;
+            mix_cycles += mixed;
+            // At most a third of the processor: this thread runs above the
+            // title's, and a frame that takes longer than real time would
+            // starve them (the sound then breaks up instead).
+            uint32_t mixed_ms = uint32_t(mixed / 733000);
+            if (mixed_ms)
+                Sleep(2 * mixed_ms);
             if (c.submitted == submitted) {
                 // No frame (XAudio not started yet): this thread runs above
                 // the title's, which must get to start it.
