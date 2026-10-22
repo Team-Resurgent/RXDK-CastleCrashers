@@ -1,0 +1,9 @@
+# Everything from the user's own package, and what is generated from it.
+/game/
+/build/
+/out/
+/gamecode/
+/rxdk.project.json
+# Fetched by tools/build.py.
+/extern/
+__pycache__/

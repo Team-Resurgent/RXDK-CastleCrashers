@@ -1,0 +1,42 @@
+# XenonRecomp configuration for Castle Crashers (title 584108B7, title update 2).
+# Paths are relative to this file. The XEX is the user's own package's, with
+# the title update applied (tools/build.py).
+[main]
+file_path = "../build/default.xex"
+out_directory_path = "../build/ppc"
+switch_table_file_path = "castlecrashers_switch_tables.toml"
+
+skip_lr = true
+skip_msr = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+# r0, r2, r11 and r12 stay in the context too: the register save and restore
+# helpers (__savefpr_*, __savevmx_*) take their address in r11 and r12.
+non_argument_as_local = false
+# r14-r31 stay in the context: the compiler's __finally funclets are separate
+# functions here that use their parent's non-volatile registers.
+non_volatile_as_local = false
+
+restgprlr_14_address = 0x8218B5A0
+savegprlr_14_address = 0x8218B550
+restfpr_14_address = 0x8218C36C
+savefpr_14_address = 0x8218C320
+restvmx_14_address = 0x8218D268
+savevmx_14_address = 0x8218CFD0
+restvmx_64_address = 0x8218D2FC
+savevmx_64_address = 0x8218D064
+
+
+# Functions that end in a jump table (tools/find_switch_funcs.py): XenonAnalyse
+# ends them at the bctr.
+functions = [
+    { address = 0x82073740, size = 0x4D0 },
+    { address = 0x82073F58, size = 0xBC },
+    { address = 0x82074698, size = 0x11C },
+    { address = 0x8216D220, size = 0x724 },
+    { address = 0x82175ED8, size = 0xE4 },
+    { address = 0x821768D8, size = 0x398 },
+    { address = 0x821A6ED0, size = 0x270 },
+]
