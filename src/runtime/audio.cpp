@@ -80,48 +80,14 @@ uint32_t queued() {
     return (output.write + size - play) % size;
 }
 
-// A submitted frame (six channels of 256 big-endian floats, one after
-// another: front left, right, centre, LFE, back left, right) as stereo.
+// A submitted frame (six channels of 256 big-endian floats). XAudio's mix
+// is not heard: the voices play on the APU (runtime/xma.cpp), and XAudio's
+// resamplers do not fill its input (runtime/xaudio.cpp). The speakers'
+// buffer stays silent; the frame only moves the write position, which
+// paces XAudio.
 void play_frame(uint32_t samples) {
-    if (!output.buffer)
-        return;
-    static int16_t stereo[kFrameSamples * 2];
-    auto channel = [&](uint32_t ch, uint32_t i) {
-        uint32_t bits = guest::load32(samples + (ch * kFrameSamples + i) * 4);
-        float f;
-        __builtin_memcpy(&f, &bits, 4);
-        return f;
-    };
-    for (uint32_t i = 0; i < kFrameSamples; i++) {
-        float centre = channel(2, i) * 0.7071f;
-        float left = channel(0, i) + centre + channel(4, i) * 0.7071f;
-        float right = channel(1, i) + centre + channel(5, i) * 0.7071f;
-        auto pcm = [](float v) {
-            int s = int(v * 32767.0f);
-            return int16_t(s < -32768 ? -32768 : s > 32767 ? 32767 : s);
-        };
-        stereo[i * 2] = pcm(left);
-        stereo[i * 2 + 1] = pcm(right);
-    }
-    void *p1, *p2;
-    DWORD n1, n2;
-    if (SUCCEEDED(output.buffer->Lock(output.write, kOutputFrameBytes, &p1, &n1, &p2, &n2, 0))) {
-        __builtin_memcpy(p1, stereo, n1);
-        if (p2)
-            __builtin_memcpy(p2, reinterpret_cast<uint8_t*>(stereo) + n1, n2);
-        output.buffer->Unlock(p1, n1, p2, n2);
-    }
+    (void)samples;
     output.write = (output.write + kOutputFrameBytes) % (kOutputFrames * kOutputFrameBytes);
-    // Half a buffer ahead is a frame from the last lap: silenced, so a play
-    // cursor that overtakes the frames written plays nothing rather than
-    // old sound again.
-    uint32_t stale = (output.write + kOutputFrames / 2 * kOutputFrameBytes) % (kOutputFrames * kOutputFrameBytes);
-    if (SUCCEEDED(output.buffer->Lock(stale, kOutputFrameBytes, &p1, &n1, &p2, &n2, 0))) {
-        __builtin_memset(p1, 0, n1);
-        if (p2)
-            __builtin_memset(p2, 0, n2);
-        output.buffer->Unlock(p1, n1, p2, n2);
-    }
 }
 
 DWORD WINAPI client_thread(void* parameter) {

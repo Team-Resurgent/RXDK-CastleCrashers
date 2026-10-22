@@ -25,9 +25,9 @@ Early work in progress.
   (about two and a half minutes) and the character select into the first
   level.
 - Sound and music play: each of the title's XMA voices on an APU voice of
-  its own, from sounds converted when the game is built. XAudio's own mix
-  is silent; it does not apply the voices' volume and pitch yet, and in
-  gameplay it runs slightly behind real time.
+  its own, from sounds converted when the game is built. XAudio keeps its
+  voices' timing but its resamplers only advance their positions and its
+  mix is not heard; the voices' volume and pitch are not applied yet.
 - The title draws its vector art into textures on the processor at load
   time; its spans and the packing into textures run as native code
   (`src/runtime/title.cpp`), the same to the bit as the recompiled code.
