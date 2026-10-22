@@ -316,7 +316,7 @@ struct Voice {
     // When it last had a frame written, and when the title last took a
     // frame of its context.
     DWORD last_write = 0, last_taken = 0;
-    uint32_t passes = 0;  // decoder passes, to read the play position every few
+    DWORD checked = 0;  // when its play position was last read
     Feed feed;
     // From XAudio, and what was last applied.
     volatile float ratio = 0, gain = 1;
@@ -513,8 +513,11 @@ void feed_voice(Voice& v) {
             end_feed(v);  // played out
         return;
     }
-    if (++v.passes % 2)
-        return;  // the play position is costly to read (the APU's)
+    // The play position is costly to read (the APU's): every 20 ms, well
+    // within the lead (about 130 ms).
+    if (now - v.checked < 20)
+        return;
+    v.checked = now;
     for (uint32_t lead = voice_lead(v); lead < kLeadFrames && more(); lead++)
         feed_frame(v);
 }

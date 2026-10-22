@@ -37,6 +37,7 @@ uint8_t pages[kHeapPages];
 uint8_t released[kHeapPages];
 std::map<uint32_t, uint32_t> blocks;  // start -> size of each reservation
 uint32_t committed, resident_total;
+uint32_t first_free;  // no page below it is free (reserve's first fit starts there)
 CRITICAL_SECTION lock;
 
 struct Lock {
@@ -131,7 +132,10 @@ uint32_t reserve(uint32_t size, uint32_t align) {
         align = kPage;
     uint32_t count = size / kPage, step = align / kPage;
     Lock held;
-    for (uint32_t first = 0; first + count <= kHeapPages; first += step) {
+    // Every page below first_free is in use: first fit from there.
+    while (first_free < kHeapPages && pages[first_free] != kFree)
+        first_free++;
+    for (uint32_t first = first_free / step * step; first + count <= kHeapPages; first += step) {
         uint32_t i = 0;
         while (i < count && pages[first + i] == kFree)
             i++;
@@ -261,7 +265,9 @@ void free(uint32_t address) {
     }
     decommit(address, size);
     Lock held;
-    memset(pages + (address - kHeap) / kPage, kFree, size / kPage);
+    uint32_t first = (address - kHeap) / kPage;
+    memset(pages + first, kFree, size / kPage);
+    first_free = first < first_free ? first : first_free;
 }
 
 uint32_t block_size(uint32_t address) {

@@ -98,28 +98,34 @@ DWORD WINAPI client_thread(void* parameter) {
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
     uint64_t frames = 0, last_frames = 0, mix_cycles = 0;
-    uint32_t dropped = 0;
+    uint32_t dropped = 0, owed = 0;  // owed: frames to mix before reading the play position again
     DWORD last_log = GetTickCount();
     while (c.running) {
         if (output.buffer) {
             // Paced by the speakers: a frame whenever fewer than
             // kOutputAheadFrames are queued. Fallen behind (the play cursor
             // overtook the frames written): start again just ahead of it.
-            DirectSoundDoWork();
-            uint32_t ahead = queued();
-            if (ahead > (kOutputFrames - 2) * kOutputFrameBytes) {
-                DWORD play = 0, write = 0;
-                output.buffer->GetCurrentPosition(&play, &write);
-                output.write = (play / kOutputFrameBytes + 2) % kOutputFrames * kOutputFrameBytes;
-                dropped++;
-            } else if (ahead >= kOutputAheadFrames * kOutputFrameBytes) {
-                // Until the queue is down to the mark (the play position is
-                // costly to read: not every millisecond).
-                uint32_t spare = ahead - kOutputAheadFrames * kOutputFrameBytes;
-                uint32_t ms = spare / (kRate * 4 / 1000);
-                Sleep(ms ? ms : 1);
-                continue;
+            // The play position is costly to read (the APU's): once per
+            // run of the frames the queue is short of.
+            if (!owed) {
+                DirectSoundDoWork();
+                uint32_t ahead = queued();
+                if (ahead > (kOutputFrames - 2) * kOutputFrameBytes) {
+                    DWORD play = 0, write = 0;
+                    output.buffer->GetCurrentPosition(&play, &write);
+                    output.write = (play / kOutputFrameBytes + 2) % kOutputFrames * kOutputFrameBytes;
+                    ahead = 2 * kOutputFrameBytes;
+                    dropped++;
+                } else if (ahead >= kOutputAheadFrames * kOutputFrameBytes) {
+                    // Until the queue is down to the mark.
+                    uint32_t spare = ahead - kOutputAheadFrames * kOutputFrameBytes;
+                    uint32_t ms = spare / (kRate * 4 / 1000);
+                    Sleep(ms ? ms : 1);
+                    continue;
+                }
+                owed = (kOutputAheadFrames * kOutputFrameBytes - ahead) / kOutputFrameBytes + 1;
             }
+            owed--;
             PPCContext& ctx = c.thread->ctx;
             ctx.r1.u64 = c.thread->stack + c.thread->stack_size - 0x100;
             ctx.r3.u64 = c.argument;
