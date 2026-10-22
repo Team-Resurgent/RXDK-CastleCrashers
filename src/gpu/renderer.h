@@ -61,6 +61,11 @@ void present();
 // Diagnostic: log the next frame's draws.
 void request_debug_frame();
 
+// The title has finished drawing an A8R8G8B8 texture (big-endian texels,
+// width by height, linear) at the guest address: compressed now, and its
+// guest memory released; drawn from when a fetch matches it. Any thread.
+void prepare_texture(uint32_t guest, uint32_t width, uint32_t height);
+
 // Cycles spent in Direct3D's DrawPrimitiveUP so far (statistics).
 uint64_t draw_call_cycles();
 // Palettes baked so far (statistics).

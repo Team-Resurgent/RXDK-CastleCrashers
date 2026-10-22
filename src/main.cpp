@@ -72,6 +72,7 @@ const Import imports[] = {
 }  // namespace
 
 int main() {
+    guest::GuestFaults faults;
     log("Castle Crashers: starting\n");
     if (!guest::init())
         fatal("no guest memory\n");
@@ -84,6 +85,7 @@ int main() {
         fatal("cannot read D:\\default.xex\n");
     uint32_t header_size = (uint32_t(start[8]) << 24) | (uint32_t(start[9]) << 16) | (uint32_t(start[10]) << 8) | start[11];
     uint32_t header = guest::alloc(header_size);
+    guest::touch(header, header_size);
     if (!read_file("D:\\default.xex", guest::host(header), header_size))
         fatal("cannot read the XEX header\n");
 

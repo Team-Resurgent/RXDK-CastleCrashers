@@ -137,6 +137,7 @@ IMPORT(NtReadFile) {
     HANDLE h = kernel::host_handle(ctx.r3.u32);
     uint32_t status_block = ctx.r7.u32;
     DWORD read = 0;
+    guest::touch(ctx.r8.u32, ctx.r9.u32);  // the file system fills it: no faults
     if (!seek(h, ctx.r10.u32) || !ReadFile(h, guest::host(ctx.r8.u32), ctx.r9.u32, &read, nullptr)) {
         io_status(status_block, kUnsuccessful, 0);
         ctx.r3.u64 = kUnsuccessful;
@@ -152,6 +153,7 @@ IMPORT(NtReadFile) {
 IMPORT(NtWriteFile) {
     HANDLE h = kernel::host_handle(ctx.r3.u32);
     DWORD written = 0;
+    guest::touch(ctx.r8.u32, ctx.r9.u32);
     if (!seek(h, ctx.r10.u32) || !WriteFile(h, guest::host(ctx.r8.u32), ctx.r9.u32, &written, nullptr)) {
         io_status(ctx.r7.u32, kUnsuccessful, 0);
         ctx.r3.u64 = kUnsuccessful;

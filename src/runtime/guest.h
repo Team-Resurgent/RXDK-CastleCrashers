@@ -52,14 +52,52 @@ uint32_t block_size(uint32_t address);
 
 // NtAllocateVirtualMemory's reserve and commit: reserve takes address space
 // only, commit backs pages of a reserved block with memory.
+//
+// Commit is lazy: the title commits far more than it touches (a 32 MB heap,
+// a 6 MB arena per 360 processor), so a committed page gets its memory, zeroed,
+// the first time it is touched. The touch faults, and the GuestFaults frame
+// of the thread that touched it commits the page and goes on.
 uint32_t reserve(uint32_t size, uint32_t align);
 bool commit(uint32_t address, uint32_t size);
 bool decommit(uint32_t address, uint32_t size);
 // The reserved block containing address: its start and size (false if none).
 bool query(uint32_t address, uint32_t& start, uint32_t& size, bool& committed);
+// Gives committed pages in [address, address + size) their memory now: for
+// buffers the kernel fills (file reads), which do not fault pages in.
+void touch(uint32_t address, uint32_t size);
 
-// Committed heap memory, for the log.
+// The pages wholly inside [address, address + size) give up their memory
+// and contents while staying committed: the renderer has taken the texture
+// that was there. If the title touches one again it is a zeroed page, and the
+// range's state says so.
+void release(uint32_t address, uint32_t size);
+enum class Released { kKept, kTouched, kGone };
+// kKept: nothing touched since release; kTouched: the title wrote there
+// again; kGone: the title freed the memory.
+Released released_state(uint32_t address, uint32_t size);
+
+// Committed heap memory (what the title asked for), and the part of it that
+// has memory, for the log.
 uint32_t committed_bytes();
+uint32_t resident_bytes();
+// Logs the count blocks with the most touched memory, and the rest's total.
+void log_blocks(uint32_t count);
+
+// Guest memory faults handled on this thread while this lives on its stack:
+// an x86 structured exception handler frame (fs:[0]). Every thread that
+// touches guest memory starts with one.
+class GuestFaults {
+public:
+    GuestFaults();
+    ~GuestFaults();
+    GuestFaults(const GuestFaults&) = delete;
+
+private:
+    // The system's EXCEPTION_REGISTRATION_RECORD: the frame registered
+    // before this one, and the handler.
+    void* next_;
+    void* handler_;
+};
 
 // Diagnostic: narrow a search for a dword holding value (memory.cpp scan);
 // the number of candidates left, and the candidates.

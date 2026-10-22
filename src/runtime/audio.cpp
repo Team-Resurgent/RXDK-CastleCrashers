@@ -124,6 +124,7 @@ void play_frame(uint32_t samples) {
 }
 
 DWORD WINAPI client_thread(void* parameter) {
+    guest::GuestFaults faults;
     Client& c = *static_cast<Client*>(parameter);
     set_current_thread(c.thread);
     LARGE_INTEGER frequency, start, now;

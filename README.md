@@ -19,6 +19,20 @@ Early work in progress. **Nothing is playable yet.**
 
 - Title update 2 is applied to `default.xex` and the whole title
   recompiles (7,170 functions).
+- In xemu it runs its logos, legal screen, attract sequence and title menu,
+  drawn on the NV2A, at about 30 frames a second. Nothing has been played
+  yet (no input tested), and sound is not working.
+- Memory, aiming at a retail 64 MB console:
+  - Guest memory is committed when it is touched: the title commits a 32 MB
+    heap, a 6 MB arena per 360 hardware thread and a 16 MB GPU block, and
+    touches a fraction of them (`src/runtime/memory.cpp`).
+  - One job worker instead of five: the workers rasterize the title's
+    vector art into textures, each with its own arena.
+  - Each rasterized texture is compressed to DXT5 as the worker finishes it
+    and its guest memory given back (`gpu::renderer::prepare_texture`):
+    the menu's textures cost a quarter of their size, once.
+  - At 64 MB (xemu, iND-BiOS) the title reaches its menu and stays there
+    with about 6 MB free; gameplay is not tested yet.
 
 ## Building
 
@@ -47,6 +61,7 @@ it in `out/Build/castlecrashers/`, and the disc image
 | XAM: the controller, no Live profile, no system UI | `src/runtime/xam.cpp` |
 | The GPU: the title's command buffers drawn with Direct3D 8 | `src/runtime/gpu.cpp`, `src/gpu` |
 | Imports not implemented yet: logging stubs | `tools/gen_stubs.py` |
+| Changes to the title itself: one job worker, polling that sleeps, rasterized textures handed to the renderer | `tools/postprocess.py` (`PATCHES`), `src/runtime/title.cpp` |
 
 Notes on the Pentium III:
 

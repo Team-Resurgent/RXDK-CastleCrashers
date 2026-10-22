@@ -2,6 +2,7 @@
 // allocator and guest calls through the function table.
 #include "guest.h"
 
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -27,11 +28,15 @@ constexpr uint32_t kHeapEnd = kWindowBase + kWindowSize;
 static_assert(kHeapEnd <= 0xA0000000, "GPU physical addresses map to 0x80000000 + address");
 constexpr uint32_t kHeapPages = (kHeapEnd - kHeap) / kPage;
 
-enum : uint8_t { kFree, kReserved, kCommitted };
+// kLazy: committed for the title, with no memory until it is touched.
+enum : uint8_t { kFree, kReserved, kCommitted, kLazy };
 
 uint8_t pages[kHeapPages];
+// Pages release() took the memory of: 1 until the title touches one (2).
+// Cleared when the title decommits or frees them.
+uint8_t released[kHeapPages];
 std::map<uint32_t, uint32_t> blocks;  // start -> size of each reservation
-uint32_t committed;
+uint32_t committed, resident;
 CRITICAL_SECTION lock;
 
 struct Lock {
@@ -43,7 +48,60 @@ bool host_commit(uint32_t address, uint32_t size) {
     return VirtualAlloc(host(address), size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 }
 
+// A lazily committed page's memory, zeroed (lock held). False when the
+// console has none left.
+bool make_resident(uint32_t p) {
+    uint32_t address = kHeap + p * kPage;
+    if (!host_commit(address, kPage))
+        return false;
+    memset(host(address), 0, kPage);
+    pages[p] = kCommitted;
+    resident += kPage;
+    return true;
+}
+
+// The structured exception handler of GuestFaults' frames: an access
+// violation on a lazily committed page commits it and resumes the
+// instruction; anything else goes on to the next handler.
+struct ExceptionRecord {
+    DWORD code, flags;
+    ExceptionRecord* record;
+    void* address;
+    DWORD parameters;
+    ULONG_PTR information[15];
+};
+constexpr int kContinueExecution = 0, kContinueSearch = 1;
+
+extern "C" int __cdecl guest_fault_handler(ExceptionRecord* record, void*, void*, void*) {
+    if (record->code != 0xC0000005 || record->parameters < 2 || (record->flags & 6))  // access violation
+        return kContinueSearch;  // flags 6: unwinding
+    uint32_t guest = uint32_t(record->information[1] - reinterpret_cast<ULONG_PTR>(base.window)) + kWindowBase;
+    if (guest < kHeap || guest >= kHeapEnd)
+        return kContinueSearch;
+    Lock held;
+    uint32_t p = (guest - kHeap) / kPage;
+    if (pages[p] == kCommitted)
+        return kContinueExecution;  // another thread committed it first
+    if (pages[p] != kLazy)
+        return kContinueSearch;
+    if (released[p])
+        released[p] = 2;
+    if (!make_resident(p)) {
+        log("guest: no memory for the page at %08X (%u KB resident)\n", kHeap + p * kPage, resident >> 10);
+        return kContinueSearch;
+    }
+    return kContinueExecution;
+}
+
 }  // namespace
+
+GuestFaults::GuestFaults() : handler_(reinterpret_cast<void*>(&guest_fault_handler)) {
+    void* frame = this;
+    __asm__ volatile("movl %%fs:0, %0" : "=r"(next_));
+    __asm__ volatile("movl %0, %%fs:0" : : "r"(frame) : "memory");
+}
+
+GuestFaults::~GuestFaults() { __asm__ volatile("movl %0, %%fs:0" : : "r"(next_) : "memory"); }
 
 bool init() {
     InitializeCriticalSection(&lock);
@@ -95,18 +153,65 @@ bool commit(uint32_t address, uint32_t size) {
     uint32_t first = (address - kHeap) / kPage;
     uint32_t last = (address + size - 1 - kHeap) / kPage;
     Lock held;
-    for (uint32_t p = first; p <= last; p++) {
+    for (uint32_t p = first; p <= last; p++)
         if (pages[p] == kFree)
             return false;
+    for (uint32_t p = first; p <= last; p++) {
         if (pages[p] == kReserved) {
-            if (!host_commit(kHeap + p * kPage, kPage))
-                return false;
-            memset(host(kHeap + p * kPage), 0, kPage);
-            pages[p] = kCommitted;
+            pages[p] = kLazy;
             committed += kPage;
         }
     }
     return true;
+}
+
+void release(uint32_t address, uint32_t size) {
+    if (address < kHeap || address >= kHeapEnd || size < kPage)
+        return;
+    uint32_t first = (address - kHeap + kPage - 1) / kPage;  // whole pages only
+    uint32_t end = (address + size - kHeap) / kPage;
+    Lock held;
+    for (uint32_t p = first; p < end && p < kHeapPages; p++) {
+        if (pages[p] == kCommitted) {
+            VirtualFree(host(kHeap + p * kPage), kPage, MEM_DECOMMIT);
+            resident -= kPage;
+            pages[p] = kLazy;
+        }
+        if (pages[p] == kLazy)
+            released[p] = 1;
+    }
+}
+
+Released released_state(uint32_t address, uint32_t size) {
+    if (address < kHeap || address >= kHeapEnd || size < kPage)
+        return Released::kGone;
+    uint32_t first = (address - kHeap + kPage - 1) / kPage;
+    uint32_t end = (address + size - kHeap) / kPage;
+    Released state = Released::kKept;
+    Lock held;
+    for (uint32_t p = first; p < end && p < kHeapPages; p++) {
+        if (!released[p])
+            return Released::kGone;
+        if (released[p] == 2)
+            state = Released::kTouched;
+    }
+    return state;
+}
+
+void touch(uint32_t address, uint32_t size) {
+    if (!size || address < kHeap || address >= kHeapEnd)
+        return;
+    uint32_t first = (address - kHeap) / kPage;
+    uint32_t last = (address + size - 1 - kHeap) / kPage;
+    Lock held;
+    for (uint32_t p = first; p <= last && p < kHeapPages; p++) {
+        if (pages[p] != kLazy)
+            continue;
+        if (released[p])
+            released[p] = 2;
+        if (!make_resident(p))
+            log("guest: no memory for the page at %08X (%u KB resident)\n", kHeap + p * kPage, resident >> 10);
+    }
 }
 
 bool decommit(uint32_t address, uint32_t size) {
@@ -118,9 +223,13 @@ bool decommit(uint32_t address, uint32_t size) {
     for (uint32_t p = first; p <= last; p++) {
         if (pages[p] == kCommitted) {
             VirtualFree(host(kHeap + p * kPage), kPage, MEM_DECOMMIT);
+            resident -= kPage;
+        }
+        if (pages[p] == kCommitted || pages[p] == kLazy) {
             pages[p] = kReserved;
             committed -= kPage;
         }
+        released[p] = 0;
     }
     return true;
 }
@@ -165,11 +274,38 @@ bool query(uint32_t address, uint32_t& start, uint32_t& size, bool& is_committed
         return false;
     start = it->first;
     size = it->second;
-    is_committed = pages[(address - kHeap) / kPage] == kCommitted;
+    uint8_t state = pages[(address - kHeap) / kPage];
+    is_committed = state == kCommitted || state == kLazy;
     return true;
 }
 
 uint32_t committed_bytes() { return committed; }
+uint32_t resident_bytes() { return resident; }
+
+void log_blocks(uint32_t count) {
+    struct Use {
+        uint32_t start, size, touched;
+    };
+    std::vector<Use> uses;
+    {
+        Lock held;
+        for (auto& [start, size] : blocks) {
+            uint32_t touched = 0;
+            for (uint32_t p = (start - kHeap) / kPage, n = size / kPage; n--; p++)
+                touched += pages[p] == kCommitted ? kPage : 0;
+            uses.push_back({start, size, touched});
+        }
+    }
+    std::sort(uses.begin(), uses.end(), [](const Use& a, const Use& b) { return a.touched > b.touched; });
+    uint32_t small = 0;
+    for (size_t i = 0; i < uses.size(); i++) {
+        if (i < count)
+            log("guest: block %08X, %u KB, %u KB touched\n", uses[i].start, uses[i].size >> 10, uses[i].touched >> 10);
+        else
+            small += uses[i].touched;
+    }
+    log("guest: %u more blocks, %u KB touched\n", unsigned(uses.size() > count ? uses.size() - count : 0), small >> 10);
+}
 
 // Diagnostic (input script "scan" / "poke"): narrowing searches for a guest
 // dword, as a cheat finder does. The first scan covers the image and the

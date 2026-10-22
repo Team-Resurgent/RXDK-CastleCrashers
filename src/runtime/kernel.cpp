@@ -97,13 +97,28 @@ GuestThread* all_threads;
 DWORD WINAPI watchdog_thread(void*) {
     for (;;) {
         Sleep(5000);
-        MEMORYSTATUS memory;
-        GlobalMemoryStatus(&memory);
-        log("watchdog: %u s up, %u KB free, %u KB of guest memory committed\n", unsigned(GetTickCount() / 1000),
-            unsigned(memory.dwAvailPhys >> 10), guest::committed_bytes() >> 10);
+        // The console's memory, by the kernel's categories (pages, but the
+        // virtual-memory byte count).
+        MM_STATISTICS mm = {};
+        mm.Length = sizeof(mm);
+        MmQueryStatistics(&mm);
+        log("watchdog: %u s up, %u KB free, %u KB of guest memory committed, %u KB of it touched; "
+            "console: virtual %u KB, image %u KB, stacks %u KB, pool %u KB, cache %u KB\n",
+            unsigned(GetTickCount() / 1000), unsigned(mm.AvailablePages * 4), guest::committed_bytes() >> 10,
+            guest::resident_bytes() >> 10, unsigned(mm.VirtualMemoryBytesCommitted >> 10),
+            unsigned(mm.ImagePagesCommitted * 4), unsigned(mm.StackPagesCommitted * 4),
+            unsigned(mm.PoolPagesCommitted * 4), unsigned(mm.CachePagesCommitted * 4));
         // The threads every minute (each line is serial time).
         static unsigned rounds;
-        if (++rounds % 12 != 1)
+        if (rounds % 6 == 5)  // every 30 s: where the memory is
+            guest::log_blocks(14);
+        if (++rounds == 5 || rounds == 9) {
+            // 25 and 45 s in: what each thread has been calling (a title
+            // spinning on something that never comes).
+            for (GuestThread* t = all_threads; t; t = t->next)
+                dump_calls(t, 60);
+        }
+        if (rounds % 12 != 1)
             continue;
         for (GuestThread* t = all_threads; t; t = t->next)
             if (t->import)
@@ -123,6 +138,7 @@ void mark_exited(GuestThread* t, uint32_t status) {
 }
 
 DWORD WINAPI thread_entry(void* parameter) {
+    guest::GuestFaults faults;
     GuestThread* thread = static_cast<GuestThread*>(parameter);
     this_thread = thread;
     PPCContext& ctx = thread->ctx;
@@ -275,8 +291,25 @@ void trace_import(const char* name, void* caller) {
 
 uint64_t idle_cycles() { return idle_total; }
 
+namespace {
+// A runtime thread's routine, run under a GuestFaults frame (they read and
+// write guest memory).
+struct RuntimeThread {
+    LPTHREAD_START_ROUTINE routine;
+    void* parameter;
+};
+
+DWORD WINAPI runtime_thread_entry(void* parameter) {
+    guest::GuestFaults faults;
+    RuntimeThread start = *static_cast<RuntimeThread*>(parameter);
+    delete static_cast<RuntimeThread*>(parameter);
+    return start.routine(start.parameter);
+}
+}  // namespace
+
 HANDLE start_runtime_thread(LPTHREAD_START_ROUTINE routine, void* parameter, uint32_t stack_size) {
-    HANDLE h = CreateThread(nullptr, stack_size, routine, parameter, CREATE_SUSPENDED, nullptr);
+    HANDLE h = CreateThread(nullptr, stack_size, runtime_thread_entry, new RuntimeThread{routine, parameter},
+                            CREATE_SUSPENDED, nullptr);
     if (!h)
         fatal("kernel: cannot start a runtime thread\n");
     SetThreadPriority(h, kRuntimePriority);
@@ -916,11 +949,13 @@ IMPORT(NtQueryVirtualMemory) {
 IMPORT(MmAllocatePhysicalMemoryEx) {
     // (flags, size, protect, min address, max address, alignment)
     uint32_t align = ctx.r8.u32 > guest::kPage ? ctx.r8.u32 : guest::kPage;
-    if (ctx.r4.u32 >= 0x40000) {
-        log("kernel: physical %u KB (%u KB committed before)\n", ctx.r4.u32 >> 10, guest::committed_bytes() >> 10);
+    uint32_t size = ctx.r4.u32;
+    ctx.r3.u64 = guest::alloc(size, align);
+    if (size >= 0x40000) {
+        log("kernel: physical %u KB at %08X (%u KB committed before)\n", size >> 10, ctx.r3.u32,
+            guest::committed_bytes() >> 10);
         dump_calls(current_thread(), 12);
     }
-    ctx.r3.u64 = guest::alloc(ctx.r4.u32, align);
     if (!ctx.r3.u32)
         log("kernel: no physical memory for %u KB (%u KB committed)\n", ctx.r4.u32 >> 10, guest::committed_bytes() >> 10);
 }

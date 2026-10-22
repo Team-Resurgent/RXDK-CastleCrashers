@@ -4,6 +4,8 @@
 // src/xenia/gpu (registers.h, xenos.h, texture_address.h).
 #include "gpu/renderer.h"
 
+#include "runtime/guest.h"
+
 #include <xtl.h>
 #include <xgraphics.h>
 
@@ -110,7 +112,35 @@ struct Texture {
     uint32_t hash = 0;               // of the guest data it was made from (sample_hash)
     uint32_t checked = ~0u;          // the frame the hash was last compared in
     uint32_t used = 0;               // the frame it was last drawn with (eviction)
+    // The guest data it was made from. Once that has not changed for a
+    // second it is released (guest::release): the texture is the only copy,
+    // kept until the title writes there again or frees it.
+    uint32_t guest = 0, guest_bytes = 0, stable = 0;
+    bool released = false;
+    uint32_t prepared = 0;  // the prepared texture it is (its sequence number), 0: none
 };
+
+// Textures the title's rasterizer has finished (prepare_texture), by guest
+// address: compressed as soon as they are drawn, their guest memory
+// released, so a texture costs a quarter of its size whether or not it is
+// ever drawn. The renderer takes one when a fetch matches it.
+struct Prepared {
+    std::vector<uint8_t> dxt5;  // emptied when the renderer has taken it
+    uint32_t width, height, sequence;
+};
+std::map<uint32_t, Prepared> prepared;
+uint32_t prepared_sequence;
+CRITICAL_SECTION prepared_lock;
+struct PreparedLockInit {
+    PreparedLockInit() { InitializeCriticalSection(&prepared_lock); }
+} prepared_lock_init;
+struct PreparedLock {
+    PreparedLock() { EnterCriticalSection(&prepared_lock); }
+    ~PreparedLock() { LeaveCriticalSection(&prepared_lock); }
+};
+
+// Frames a texture's guest data must stay the same before it is released.
+constexpr uint32_t kStableFrames = 8;
 
 struct TextureKey {
     uint32_t address, format_size, slice;
@@ -201,6 +231,7 @@ struct Image {
     uint32_t pot_w = 0, pot_h = 0, pot_blocks_w = 0;
     D3DFORMAT d3d_format = D3DFMT_UNKNOWN;
     bool tiled = false;
+    uint32_t endian = 0;  // the fetch's byte swap (2: 8 in 32)
     // Several images: a 3D texture's depth slices (volume) or a stacked 2D
     // texture's layers (array). One of them is read (slice).
     uint32_t depth = 1, slice = 0;
@@ -240,6 +271,7 @@ bool fetch_image(const GpuState& gpu, uint32_t slot, Image& image, bool read = t
         return false;
     image.format = f[1] & 0x3F;
     uint32_t endian = (f[1] >> 6) & 3;
+    image.endian = endian;
     image.address = (f[1] >> 12) << 12;
     uint32_t dimension = (f[5] >> 9) & 3;  // 1D, 2D or stacked, 3D, cube
     bool packed_mips = (f[5] >> 11) & 1;
@@ -395,9 +427,100 @@ IDirect3DTexture8* create_argb(const std::vector<uint32_t>& texels, uint32_t w, 
     return texture;
 }
 
+// A 4x4 block of A8R8G8B8 texels as DXT5: the alpha ramp between the
+// block's lowest and highest alpha, the colours on the line between the
+// corners of their box. Quick rather than best: the title's art is drawn
+// into textures as it loads, and 64 MB holds them only compressed.
+void encode_dxt5_block(const uint32_t texels[16], uint8_t out[16]) {
+    int a_min = 255, a_max = 0, lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
+    for (int i = 0; i < 16; i++) {
+        uint32_t t = texels[i];
+        int a = int(t >> 24), c[3] = {int((t >> 16) & 0xFF), int((t >> 8) & 0xFF), int(t & 0xFF)};
+        a_min = a < a_min ? a : a_min;
+        a_max = a > a_max ? a : a_max;
+        for (int k = 0; k < 3; k++) {
+            lo[k] = c[k] < lo[k] ? c[k] : lo[k];
+            hi[k] = c[k] > hi[k] ? c[k] : hi[k];
+        }
+    }
+    // Alpha: a0 = max, a1 = min (eight-value mode); a texel's code from its
+    // step 0 (min) .. 7 (max) on the ramp.
+    out[0] = uint8_t(a_max);
+    out[1] = uint8_t(a_min);
+    uint64_t alpha_bits = 0;
+    int a_range = a_max - a_min;
+    static const uint8_t kAlphaCode[8] = {1, 7, 6, 5, 4, 3, 2, 0};
+    for (int i = 0; a_range && i < 16; i++) {
+        int step = ((int(texels[i] >> 24) - a_min) * 7 + a_range / 2) / a_range;
+        alpha_bits |= uint64_t(kAlphaCode[step]) << (3 * i);
+    }
+    for (int k = 0; k < 6; k++)
+        out[2 + k] = uint8_t(alpha_bits >> (8 * k));
+    // Colour: c0 = the box's high corner, c1 its low corner (four-colour
+    // mode for DXT5 whatever their order); a texel's code from its step 0
+    // (low) .. 3 (high) along the diagonal.
+    auto rgb565 = [](const int c[3]) { return uint16_t(((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3)); };
+    uint16_t c0 = rgb565(hi), c1 = rgb565(lo);
+    out[8] = uint8_t(c0);
+    out[9] = uint8_t(c0 >> 8);
+    out[10] = uint8_t(c1);
+    out[11] = uint8_t(c1 >> 8);
+    int axis[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
+    int length = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
+    uint32_t colour_bits = 0;
+    static const uint8_t kColourCode[4] = {1, 3, 2, 0};
+    for (int i = 0; length && i < 16; i++) {
+        uint32_t t = texels[i];
+        int d = (int((t >> 16) & 0xFF) - lo[0]) * axis[0] + (int((t >> 8) & 0xFF) - lo[1]) * axis[1] +
+                (int(t & 0xFF) - lo[2]) * axis[2];
+        int step = (d * 3 + length / 2) / length;
+        step = step < 0 ? 0 : step > 3 ? 3 : step;
+        colour_bits |= uint32_t(kColourCode[step]) << (2 * i);
+    }
+    for (int k = 0; k < 4; k++)
+        out[12 + k] = uint8_t(colour_bits >> (8 * k));
+}
+
+// A8R8G8B8 texels (rows of width) as a DXT5 texture.
+IDirect3DTexture8* create_dxt5(const uint32_t* texels, uint32_t width, uint32_t height) {
+    IDirect3DTexture8* texture = nullptr;
+    if (FAILED(device->CreateTexture(width, height, 1, 0, D3DFMT_DXT5, 0, &texture))) {
+        log("renderer: no memory for a %ux%u texture\n", width, height);
+        return nullptr;
+    }
+    D3DLOCKED_RECT locked;
+    if (SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0))) {
+        uint32_t block[16];
+        for (uint32_t by = 0; by < height / 4; by++) {
+            uint8_t* row = static_cast<uint8_t*>(locked.pBits) + size_t(by) * locked.Pitch;
+            for (uint32_t bx = 0; bx < width / 4; bx++) {
+                for (uint32_t y = 0; y < 4; y++)
+                    memcpy(&block[y * 4], &texels[size_t(by * 4 + y) * width + bx * 4], 16);
+                encode_dxt5_block(block, row + bx * 16);
+            }
+        }
+        texture->UnlockRect(0);
+    }
+    return texture;
+}
+
 // An image's blocks as a new texture of the given format (its own, or one
-// with the same layout): compressed rows as they are, others swizzled.
+// with the same layout): compressed rows as they are, others swizzled. 32-bit
+// colour is stored as DXT5.
 IDirect3DTexture8* create_raw(const Image& image, D3DFORMAT format) {
+    if (format == D3DFMT_A8R8G8B8 && image.block == 1 && image.pot_w >= 4 && image.pot_h >= 4)
+        return create_dxt5(reinterpret_cast<const uint32_t*>(image.linear.data()), image.pot_w, image.pot_h);
+    if (format == D3DFMT_A4R4G4B4 && image.block == 1 && image.pot_w >= 4 && image.pot_h >= 4) {
+        // As DXT5 too: half the size (the title's font is 1024x2048).
+        std::vector<uint32_t> texels(size_t(image.pot_w) * image.pot_h);
+        const uint16_t* in = reinterpret_cast<const uint16_t*>(image.linear.data());
+        for (size_t i = 0; i < texels.size(); i++) {
+            uint32_t t = in[i];  // each 4-bit channel n as the byte n * 0x11
+            texels[i] = ((t >> 12) & 0xF) * 0x11u << 24 | ((t >> 8) & 0xF) * 0x11u << 16 | ((t >> 4) & 0xF) * 0x11u << 8 |
+                        (t & 0xF) * 0x11u;
+        }
+        return create_dxt5(texels.data(), image.pot_w, image.pot_h);
+    }
     IDirect3DTexture8* texture = nullptr;
     if (FAILED(device->CreateTexture(image.pot_w, image.pot_h, 1, 0, format, 0, &texture))) {
         log("renderer: no memory for a %ux%u texture\n", image.pot_w, image.pot_h);
@@ -452,6 +575,50 @@ void swap_dxt_red_blue(Image& image) {
 // The texture a texture fetch constant describes, as an NV2A texture.
 // red_alpha: white texels with the image's red channel as alpha (a pixel
 // shader that uses the texture as a mask).
+// The texture for key from the prepared texture at guest, if there is one
+// of this size: made once per preparation (a newer one replaces it).
+const Texture* prepared_texture(const TextureKey& key, uint32_t guest, uint32_t width, uint32_t height) {
+    PreparedLock held;
+    auto p = prepared.find(guest);
+    if (p == prepared.end() || p->second.width != width || p->second.height != height)
+        return nullptr;
+    auto it = textures.find(key);
+    if (it != textures.end() && it->second.prepared == p->second.sequence) {
+        it->second.checked = frame_number;
+        return &it->second;
+    }
+    if (p->second.dxt5.empty())
+        return nullptr;
+    IDirect3DTexture8* texture = nullptr;
+    if (FAILED(device->CreateTexture(width, height, 1, 0, D3DFMT_DXT5, 0, &texture))) {
+        log("renderer: no memory for a %ux%u texture\n", width, height);
+        return nullptr;
+    }
+    D3DLOCKED_RECT locked;
+    if (SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0))) {
+        uint32_t row = width / 4 * 16;
+        for (uint32_t y = 0; y < height / 4; y++)
+            memcpy(static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch, &p->second.dxt5[size_t(y) * row],
+                   row);
+        texture->UnlockRect(0);
+    }
+    if (it != textures.end()) {
+        if (it->second.texture)
+            it->second.texture->Release();
+        forget_textures();
+        textures.erase(it);
+    }
+    Texture t;
+    t.texture = texture;
+    t.checked = frame_number;
+    t.guest = guest;
+    t.guest_bytes = width * height * 4;
+    t.released = true;
+    t.prepared = p->second.sequence;
+    std::vector<uint8_t>().swap(p->second.dxt5);
+    return &(textures[key] = t);
+}
+
 const Texture* texture_for(const GpuState& gpu, uint32_t slot, bool red_alpha, float z) {
     Image image;
     if (!fetch_image(gpu, slot, image, false))
@@ -461,11 +628,36 @@ const Texture* texture_for(const GpuState& gpu, uint32_t slot, bool red_alpha, f
     auto it = textures.find(key);
     if (it != textures.end() && it->second.checked == frame_number)
         return &it->second;
+    if (!red_alpha && image.format == 6 && !image.tiled && image.depth == 1 && image.endian == 2 && image.data) {
+        if (const Texture* t = prepared_texture(key, guest::address_of(image.data), image.width, image.height))
+            return t;
+        it = textures.find(key);
+    }
+    if (it != textures.end() && it->second.released) {
+        // The only copy: kept until the title writes there again or frees
+        // it, then made again from what is there now (reading it would
+        // bring the memory back).
+        if (guest::released_state(it->second.guest, it->second.guest_bytes) == guest::Released::kKept) {
+            it->second.checked = frame_number;
+            return &it->second;
+        }
+        if (it->second.texture) {
+            it->second.texture->Release();
+            forget_textures();
+        }
+        textures.erase(it);
+        it = textures.end();
+    }
     uint32_t hash = sample_hash(image);
     if (it != textures.end()) {
         if (it->second.hash == hash) {
-            it->second.checked = frame_number;
-            return &it->second;
+            Texture& same = it->second;
+            same.checked = frame_number;
+            if (++same.stable == kStableFrames && same.guest_bytes) {
+                guest::release(same.guest, same.guest_bytes);
+                same.released = true;
+            }
+            return &same;
         }
         if (it->second.texture) {
             it->second.texture->Release();
@@ -485,6 +677,10 @@ const Texture* texture_for(const GpuState& gpu, uint32_t slot, bool red_alpha, f
     Texture t;
     t.hash = hash;
     t.checked = frame_number;
+    if (image.data && image.depth == 1) {  // a layer of an array shares its data with the others
+        t.guest = guest::address_of(image.data);
+        t.guest_bytes = image.data_bytes;
+    }
     t.u_scale = float(image.width) / float(pot_w);
     t.v_scale = float(image.height) / float(pot_h);
     if (red_alpha) {
@@ -930,7 +1126,8 @@ struct PixelShader {
 const PixelShader kPixelShaders[] = {
     {0x8A78BDFF, 0, -1, Mode::kModulate},  // Direct3D's clear: oC0 = r0
     {0x6A78BDFF, 0, -1, Mode::kModulate},  // the same as Castle Crashers builds it: oC0 = max(r0, r0)
-    {0x092B5AA3, 1, 0, Mode::kModulate},   // oC0 = tfetch2D(tf0, r0.xy) * r1
+    {0x092B5AA3, 1, 0, Mode::kModulate},   // oC0 = tfetch2D(tf0, r0.xy) * r1 (FontPS, SpritePS)
+    {0xD08CA250, 1, 0, Mode::kModulate},   // the same
     {0xBC82D314, 1, 0, Mode::kOpaque},     // oC0 = tfetch2D(tf0, r0.xy).xyz1 * r1
     {0x33E1A369, 1, 0, Mode::kModulate},   // sprites: oC0 = tfetch3D(tf0, r0.xyz) * r1
     {0x81DBCACE, 1, 0, Mode::kMask},       // text and images: oC0 = r1.w == 0 ? tfetch2D(tf0, r0.xy)
@@ -1371,6 +1568,28 @@ void resolve(const GpuState& gpu) {
 
 void request_debug_frame() { debug_requested = true; }
 
+void prepare_texture(uint32_t guest, uint32_t width, uint32_t height) {
+    if (width < 4 || height < 4 || (width & (width - 1)) || (height & (height - 1)))
+        return;
+    std::vector<uint8_t> dxt5(size_t(width) * height);  // 16 bytes a 4x4 block
+    uint32_t block[16];
+    for (uint32_t by = 0; by < height / 4; by++) {
+        for (uint32_t bx = 0; bx < width / 4; bx++) {
+            for (uint32_t y = 0; y < 4; y++)
+                for (uint32_t x = 0; x < 4; x++)
+                    block[y * 4 + x] = guest::load32(guest + ((by * 4 + y) * width + bx * 4 + x) * 4);
+            encode_dxt5_block(block, &dxt5[(size_t(by) * (width / 4) + bx) * 16]);
+        }
+    }
+    guest::release(guest, width * height * 4);
+    PreparedLock held;
+    Prepared& p = prepared[guest];
+    p.dxt5.swap(dxt5);
+    p.width = width;
+    p.height = height;
+    p.sequence = ++prepared_sequence;
+}
+
 uint64_t draw_call_cycles() { return primitive_cycles; }
 
 uint32_t palettes_baked() { return palette_bakes; }
@@ -1383,9 +1602,13 @@ void present() {
     uint32_t presented = ++frame_number;
     if (presented % 300 == 0) {
         // Textures not drawn with for ten seconds (an earlier level's) go.
+        // A texture that is the only copy of its data goes when the title
+        // frees that.
         auto evict = [&](auto& cache) {
             for (auto it = cache.begin(); it != cache.end();) {
-                if (presented - it->second.used > 600) {
+                const Texture& t = it->second;
+                bool sole = t.released && guest::released_state(t.guest, t.guest_bytes) != guest::Released::kGone;
+                if (sole ? false : presented - t.used > 600) {
                     if (it->second.texture)
                         it->second.texture->Release();
                     it = cache.erase(it);
@@ -1397,6 +1620,28 @@ void present() {
         };
         evict(textures);
         evict(shape_textures);
+        // Prepared textures whose memory the title has freed.
+        PreparedLock held;
+        for (auto p = prepared.begin(); p != prepared.end();) {
+            if (guest::released_state(p->first, p->second.width * p->second.height * 4) == guest::Released::kGone)
+                p = prepared.erase(p);
+            else
+                ++p;
+        }
+    }
+    if (presented % 600 == 300) {
+        // Diagnostic: the large textures whose guest data is still there.
+        uint32_t kept = 0, kept_bytes = 0, shown = 0;
+        for (auto& [key, t] : textures) {
+            if (t.released) {
+                kept++;
+                kept_bytes += t.guest_bytes;
+            } else if (t.guest_bytes >= 0x40000 && shown++ < 12) {
+                log("renderer: texture at %08X, %u KB, stable %u, drawn %u frames ago\n", t.guest, t.guest_bytes >> 10,
+                    t.stable, presented - t.used);
+            }
+        }
+        log("renderer: %u textures, %u released (%u KB)\n", unsigned(textures.size()), kept, kept_bytes >> 10);
     }
     if (presented % 1800 == 1) {
         // The caches' textures and their memory (level 0, power-of-two).

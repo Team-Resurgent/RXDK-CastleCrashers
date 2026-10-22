@@ -53,9 +53,10 @@ def main() -> int:
         "name": "gamecode", "type": "library", "configuration": "release",
         "sources": [rel(p, gamecode) for p in code],
         "includePaths": [rel(p, gamecode) for p in includes],
-        # -O2 after RXDK's -O3: as small and as fast.
+        # -Os after RXDK's -O3: the generated code is most of the XBE, and
+        # 64 MB holds the title only with the XBE small.
         "defines": DEFINES,
-        "compileFlags": FLAGS + ["-O2"],
+        "compileFlags": FLAGS + ["-Os"],
         "cppStandard": "c++20", "outputDir": "out"})
 
     runtime = sorted((ROOT / "src/runtime").glob("*.cpp")) + sorted((ROOT / "src/gpu").rglob("*.cpp"))
