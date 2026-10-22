@@ -28,9 +28,12 @@
 // worker thread does.
 #include "kernel.h"
 
+#include "ppc_recomp_shared.h"
+
 #include <dsound.h>
 
 #include <cmath>
+#include <map>
 #include <vector>
 
 namespace audio {
@@ -178,6 +181,15 @@ struct Bank {
     HANDLE file = INVALID_HANDLE_VALUE;  // else read from here as packets start
 };
 std::vector<Bank> banks;
+
+// The headers (first 4 bytes) of packets whose memory was given back
+// (runtime/io.cpp releases the sounds' XMA data as it is read): what a
+// context needs of a packet to advance as the hardware would.
+std::map<uint32_t, uint32_t> saved_headers;  // packet's guest address -> its header, as in memory
+CRITICAL_SECTION saved_headers_lock;
+struct SavedHeadersInit {
+    SavedHeadersInit() { InitializeCriticalSection(&saved_headers_lock); }
+} saved_headers_init;
 
 bool load_bank(const char* path, bool in_memory) {
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -511,11 +523,26 @@ void process_packet(Context& c, ContextData& data) {
         return;
     }
     uint32_t buffer = data.current_buffer == 0 ? data.input_buffer_0_ptr : data.input_buffer_1_ptr;
-    const uint8_t* bytes = guest::host(translate_physical(buffer) + packet * kBytesPerPacket);
-    uint32_t header_frames = bytes[0] >> 2, skip = bytes[3];
+    uint32_t address = translate_physical(buffer) + packet * kBytesPerPacket;
+    const uint8_t* bytes = guest::host(address);
+    // A released packet: its saved header. Released pages read as zeros
+    // (and one not touched since is not touched now).
+    uint8_t header[4];
+    bool saved = false;
+    uint32_t zero = 0;
+    if (!guest::resident(address) || memcmp(bytes, &zero, 4) == 0) {
+        EnterCriticalSection(&saved_headers_lock);
+        auto it = saved_headers.find(address);
+        if (it != saved_headers.end()) {
+            memcpy(header, &it->second, 4);
+            saved = true;
+        }
+        LeaveCriticalSection(&saved_headers_lock);
+    }
+    uint32_t header_frames = (saved ? header[0] : bytes[0]) >> 2, skip = saved ? header[3] : bytes[3];
 
     c.frame = 0;
-    if (find_packet(bytes, c.bank, c.record)) {
+    if (!saved && !banks.empty() && find_packet(bytes, c.bank, c.record)) {
         c.frames_left = c.record->frames;
         const BankEntry& e = c.bank->entries[c.record->entry];
         if (c.bank->file != INVALID_HANDLE_VALUE) {
@@ -715,6 +742,46 @@ DWORD WINAPI decoder_thread(void*) {
     }
 }
 
+// A packet's header (its first 4 bytes, the first in the top byte) without
+// touching a released page: the saved header then, and the zeros an
+// untouched page holds.
+uint32_t packet_header(uint32_t address) {
+    if (guest::resident(address)) {
+        uint32_t header = guest::load32(address);
+        if (header)
+            return header;
+    }
+    uint32_t header = 0;
+    EnterCriticalSection(&saved_headers_lock);
+    auto it = saved_headers.find(translate_physical(address));
+    if (it != saved_headers.end())
+        header = __builtin_bswap32(it->second);
+    LeaveCriticalSection(&saved_headers_lock);
+    return header;
+}
+
+// A byte of XMA data as it reads, without touching a page that has no
+// memory (it reads as zeros, as a released one does).
+uint32_t peek(uint32_t address) { return guest::resident(address) ? guest::load8(address) : 0; }
+
+// The bit offset in the packet at packet (with that header) past its first
+// frame and count more: the frames' lengths are their first 15 bits.
+uint32_t frame_bits(uint32_t packet, uint32_t header, uint32_t count) {
+    uint32_t bit = ((((header >> 24) & 3) << 8 | ((header >> 16) & 0xFF)) << 5 | ((header >> 8) & 0xFF) >> 3) + 32;
+    for (; count; count--) {
+        uint32_t byte = packet + (bit >> 3), shift = bit & 7, v;
+        if (shift < 2) {
+            v = peek(byte) << 8 | peek(byte + 1);
+            shift = 1 - shift;
+        } else {
+            v = (peek(byte) << 16) | (peek(byte + 1) << 8) | peek(byte + 2);
+            shift = 9 - shift;
+        }
+        bit += (v >> shift) & 0x7FFF;
+    }
+    return bit;
+}
+
 }  // namespace
 
 namespace xma {
@@ -739,6 +806,18 @@ void voice_params(uint32_t input, float ratio, float gain) {
     voice_matches++;
     c->voice.ratio = ratio;
     c->voice.gain = gain;
+}
+
+// From runtime/io.cpp, before it releases [address, address + size): the
+// packets' headers, for process_packet once their pages are gone.
+void save_packet_headers(uint32_t address, uint32_t size) {
+    EnterCriticalSection(&saved_headers_lock);
+    for (uint32_t offset = 0; offset + kBytesPerPacket <= size; offset += kBytesPerPacket) {
+        uint32_t header;
+        memcpy(&header, guest::host(address + offset), 4);
+        saved_headers[translate_physical(address + offset)] = header;
+    }
+    LeaveCriticalSection(&saved_headers_lock);
 }
 
 void init() {
@@ -791,4 +870,44 @@ IMPORT(XMAReleaseContext) {
         LeaveCriticalSection(&lock);
     }
     ctx.r3.u64 = 0;
+}
+
+// The title's XMA seek (8210C5B0): the bit offset in the data (r3, r4 bytes)
+// of frame r6, counting from packet r5; 0 past the end. It walks the packets'
+// headers, then the frame lengths (15 bits each) in the packet the frame is
+// in. Here released pages are not touched (runtime/io.cpp releases sounds'
+// data): the walk would bring the whole sound back.
+PPC_FUNC(sub_8210C5B0) {
+    uint32_t start = ctx.r3.u32, end = start + ctx.r4.u32, target = ctx.r6.u32;
+    uint32_t at = start + (ctx.r5.u32 << 11), frames = 0, header = 0;
+    for (;; at += ((header & 0xFF) + 1) << 11) {
+        if (at + 2048 > end) {
+            ctx.r3.u64 = 0;
+            return;
+        }
+        header = packet_header(at);
+        uint32_t through = (header >> 26) + frames;
+        if (through > target)
+            break;
+        frames = through;
+    }
+    ctx.r3.u64 = ((at - start) << 3) + frame_bits(at, header, target - frames);
+}
+
+// The title's other XMA seek (8210C690): the bit offset in the data (r3, r4
+// bytes) of the last frame of the stream whose first packet is r5. The last
+// packet with frames is taken to be one stride before a last packet with
+// none. As 8210C5B0, without touching released pages.
+PPC_FUNC(sub_8210C690) {
+    uint32_t start = ctx.r3.u32, end = start + ctx.r4.u32;
+    uint32_t last = start + (ctx.r5.u32 << 11);
+    uint32_t stride = ((packet_header(last) & 0xFF) + 1) << 11;
+    for (uint32_t at = last + stride; at + 2048 <= end; at += stride) {
+        last = at;
+        stride = ((packet_header(at) & 0xFF) + 1) << 11;
+    }
+    if (!(packet_header(last) >> 26))
+        last -= stride;
+    uint32_t header = packet_header(last);
+    ctx.r3.u64 = ((last - start) << 3) + frame_bits(last, header, (header >> 26) - 1);
 }

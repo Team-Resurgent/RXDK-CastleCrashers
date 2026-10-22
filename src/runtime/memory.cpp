@@ -36,7 +36,7 @@ uint8_t pages[kHeapPages];
 // Cleared when the title decommits or frees them.
 uint8_t released[kHeapPages];
 std::map<uint32_t, uint32_t> blocks;  // start -> size of each reservation
-uint32_t committed, resident;
+uint32_t committed, resident_total;
 CRITICAL_SECTION lock;
 
 struct Lock {
@@ -56,7 +56,7 @@ bool make_resident(uint32_t p) {
         return false;
     memset(host(address), 0, kPage);
     pages[p] = kCommitted;
-    resident += kPage;
+    resident_total += kPage;
     return true;
 }
 
@@ -87,7 +87,7 @@ extern "C" int __cdecl guest_fault_handler(ExceptionRecord* record, void*, void*
     if (released[p])
         released[p] = 2;
     if (!make_resident(p)) {
-        log("guest: no memory for the page at %08X (%u KB resident)\n", kHeap + p * kPage, resident >> 10);
+        log("guest: no memory for the page at %08X (%u KB resident)\n", kHeap + p * kPage, resident_total >> 10);
         return kContinueSearch;
     }
     return kContinueExecution;
@@ -165,6 +165,12 @@ bool commit(uint32_t address, uint32_t size) {
     return true;
 }
 
+bool resident(uint32_t address) {
+    if (address < kHeap || address >= kHeapEnd)
+        return true;  // the image and the registers are always there
+    return pages[(address - kHeap) / kPage] == kCommitted;  // a byte: no lock needed to read it
+}
+
 void release(uint32_t address, uint32_t size) {
     if (address < kHeap || address >= kHeapEnd || size < kPage)
         return;
@@ -174,7 +180,7 @@ void release(uint32_t address, uint32_t size) {
     for (uint32_t p = first; p < end && p < kHeapPages; p++) {
         if (pages[p] == kCommitted) {
             VirtualFree(host(kHeap + p * kPage), kPage, MEM_DECOMMIT);
-            resident -= kPage;
+            resident_total -= kPage;
             pages[p] = kLazy;
         }
         if (pages[p] == kLazy)
@@ -210,7 +216,7 @@ void touch(uint32_t address, uint32_t size) {
         if (released[p])
             released[p] = 2;
         if (!make_resident(p))
-            log("guest: no memory for the page at %08X (%u KB resident)\n", kHeap + p * kPage, resident >> 10);
+            log("guest: no memory for the page at %08X (%u KB resident)\n", kHeap + p * kPage, resident_total >> 10);
     }
 }
 
@@ -223,7 +229,7 @@ bool decommit(uint32_t address, uint32_t size) {
     for (uint32_t p = first; p <= last; p++) {
         if (pages[p] == kCommitted) {
             VirtualFree(host(kHeap + p * kPage), kPage, MEM_DECOMMIT);
-            resident -= kPage;
+            resident_total -= kPage;
         }
         if (pages[p] == kCommitted || pages[p] == kLazy) {
             pages[p] = kReserved;
@@ -280,7 +286,7 @@ bool query(uint32_t address, uint32_t& start, uint32_t& size, bool& is_committed
 }
 
 uint32_t committed_bytes() { return committed; }
-uint32_t resident_bytes() { return resident; }
+uint32_t resident_bytes() { return resident_total; }
 
 void log_blocks(uint32_t count) {
     struct Use {

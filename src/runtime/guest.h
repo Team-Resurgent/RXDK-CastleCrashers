@@ -64,6 +64,9 @@ bool commit(uint32_t address, uint32_t size);
 bool decommit(uint32_t address, uint32_t size);
 // The reserved block containing address: its start and size (false if none).
 bool query(uint32_t address, uint32_t& start, uint32_t& size, bool& committed);
+// Whether the page holding address has memory (a committed page that has
+// none was never touched: it reads as zeros).
+bool resident(uint32_t address);
 // Gives committed pages in [address, address + size) their memory now: for
 // buffers the kernel fills (file reads), which do not fault pages in.
 void touch(uint32_t address, uint32_t size);

@@ -12,6 +12,11 @@
 #include <set>
 #include <string>
 
+// The XMA decoder (xma.cpp).
+namespace xma {
+void save_packet_headers(uint32_t address, uint32_t size);
+}  // namespace xma
+
 namespace {
 
 std::set<HANDLE> directories;
@@ -248,8 +253,10 @@ IMPORT(NtReadFile) {
     // so its memory goes back. 64 MB does not hold every sound effect too.
     if (read >= 2 * guest::kPage) {
         std::string path = path_of(h);
-        if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".xma") == 0)
+        if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".xma") == 0) {
+            xma::save_packet_headers(ctx.r8.u32, read);
             guest::release(ctx.r8.u32, read);
+        }
     }
     io_status(status_block, status, read);
     if (ctx.r4.u32)

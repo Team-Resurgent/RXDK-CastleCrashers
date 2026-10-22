@@ -65,6 +65,9 @@ void request_debug_frame();
 // width by height, linear) at the guest address: compressed now, and its
 // guest memory released; drawn from when a fetch matches it. Any thread.
 void prepare_texture(uint32_t guest, uint32_t width, uint32_t height);
+// The same with the texture's A8R8G8B8 texels given (host order): the
+// guest memory at guest is only released.
+void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint32_t* texels);
 
 // Cycles spent in Direct3D's DrawPrimitiveUP so far (statistics).
 uint64_t draw_call_cycles();

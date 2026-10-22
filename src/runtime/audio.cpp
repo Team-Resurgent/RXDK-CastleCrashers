@@ -27,6 +27,7 @@ struct Client {
     volatile uint32_t submitted = 0;
 };
 Client clients[kClients];
+uint64_t output_cycles;  // in play_frame (statistics)
 
 // The speakers: a looping DirectSound buffer the submitted frames are written
 // into (48 kHz stereo), a few frames ahead of where it plays. Without one the
@@ -179,8 +180,10 @@ DWORD WINAPI client_thread(void* parameter) {
             DWORD now_ms = GetTickCount();
             if (now_ms - last_log >= 5000) {
                 uint64_t n = frames - last_frames;
-                log("audio: %u frames/s (187 needed), %u us mixing each, %u underruns\n", uint32_t(n / 5),
-                    uint32_t(n ? mix_cycles / n / 733 : 0), dropped);
+                log("audio: %u frames/s (187 needed), %u us mixing each (%u us of it output), %u underruns\n",
+                    uint32_t(n / 5), uint32_t(n ? mix_cycles / n / 733 : 0), uint32_t(n ? output_cycles / n / 733 : 0),
+                    dropped);
+                output_cycles = 0;
                 xaudio::log_profile(5);
                 last_log = now_ms;
                 last_frames = frames;
@@ -263,7 +266,9 @@ IMPORT(XAudioSubmitRenderDriverFrame) {
     int i = client_of(ctx.r3.u32);
     if (i >= 0) {
         clients[i].submitted = clients[i].submitted + 1;
+        uint64_t t0 = __builtin_ia32_rdtsc();
         play_frame(ctx.r4.u32);
+        output_cycles += __builtin_ia32_rdtsc() - t0;
     }
     ctx.r3.u64 = 0;
 }

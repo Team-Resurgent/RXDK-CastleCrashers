@@ -133,8 +133,10 @@ struct Prepared {
     std::vector<uint8_t> dxt5;
     uint32_t width, height, sequence;
 };
-// Statistics: DXT5 bytes prepared, and as compressed.
+// Statistics: DXT5 bytes prepared, and as compressed; textures compressed
+// back when idle (present).
 uint64_t prepared_raw_bytes, prepared_packed_bytes;
+uint32_t textures_compacted;
 
 // LZ4's block format: a token (literal length << 4 | match length - 4), its
 // length bytes past 15, the literals, a 16-bit little-endian distance
@@ -1658,14 +1660,22 @@ void request_debug_frame() { debug_requested = true; }
 void prepare_texture(uint32_t guest, uint32_t width, uint32_t height) {
     if (width < 4 || height < 4 || (width & (width - 1)) || (height & (height - 1)))
         return;
+    std::vector<uint32_t> texels(size_t(width) * height);
+    for (size_t i = 0; i < texels.size(); i++)
+        texels[i] = guest::load32(guest + uint32_t(i) * 4);
+    prepare_texels(guest, width, height, texels.data());
+}
+
+void prepare_texels(uint32_t guest, uint32_t width, uint32_t height, const uint32_t* texels) {
+    if (width < 4 || height < 4 || (width & (width - 1)) || (height & (height - 1)))
+        return;
     // The blocks in row order, then compressed (Prepared).
     std::vector<uint8_t> blocks(size_t(width) * height);  // 16 bytes a 4x4 block
     uint32_t block[16];
     for (uint32_t by = 0; by < height / 4; by++) {
         for (uint32_t bx = 0; bx < width / 4; bx++) {
             for (uint32_t y = 0; y < 4; y++)
-                for (uint32_t x = 0; x < 4; x++)
-                    block[y * 4 + x] = guest::load32(guest + ((by * 4 + y) * width + bx * 4 + x) * 4);
+                memcpy(&block[y * 4], &texels[size_t(by * 4 + y) * width + bx * 4], 16);
             encode_dxt5_block(block, &blocks[(size_t(by) * (width / 4) + bx) * 16]);
         }
     }
@@ -1722,6 +1732,37 @@ void present() {
                 ++p;
         }
     }
+    if (presented % 60 == 30) {
+        // Textures made from prepared ones and not drawn with for a while go
+        // back to being prepared: their blocks compressed again (a sixth of
+        // the memory), made again when next drawn. Every screen's art would
+        // otherwise stay in video memory for good, being the only copy.
+        PreparedLock held;
+        for (auto it = textures.begin(); it != textures.end();) {
+            Texture& t = it->second;
+            auto p = t.prepared && t.texture && presented - t.used > 180 ? prepared.find(t.guest) : prepared.end();
+            if (p == prepared.end() || p->second.sequence != t.prepared || !p->second.dxt5.empty()) {
+                ++it;
+                continue;
+            }
+            D3DLOCKED_RECT locked;
+            if (FAILED(t.texture->LockRect(0, &locked, nullptr, D3DLOCK_READONLY))) {
+                ++it;
+                continue;
+            }
+            uint32_t width = p->second.width, height = p->second.height, row = width / 4 * 16;
+            std::vector<uint8_t> blocks(size_t(width) * height);
+            for (uint32_t y = 0; y < height / 4; y++)
+                memcpy(&blocks[size_t(y) * row], static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch, row);
+            t.texture->UnlockRect(0);
+            p->second.dxt5 = lz_compress(blocks.data(), uint32_t(blocks.size()));
+            p->second.dxt5.shrink_to_fit();
+            t.texture->Release();
+            it = textures.erase(it);
+            forget_textures();
+            textures_compacted++;
+        }
+    }
     if (presented % 600 == 300) {
         // Diagnostic: the large textures whose guest data is still there.
         uint32_t kept = 0, kept_bytes = 0, shown = 0;
@@ -1748,9 +1789,9 @@ void present() {
             }
         }
         log("renderer: %u textures (%u KB), %u released (%u KB of guest memory); %u prepared waiting (%u KB); "
-            "prepared so far %u KB as %u KB\n",
+            "prepared so far %u KB as %u KB; %u compacted when idle\n",
             unsigned(textures.size()), d3d_bytes >> 10, kept, kept_bytes >> 10, waiting, waiting_bytes >> 10,
-            unsigned(prepared_raw_bytes >> 10), unsigned(prepared_packed_bytes >> 10));
+            unsigned(prepared_raw_bytes >> 10), unsigned(prepared_packed_bytes >> 10), textures_compacted);
     }
     if (presented % 1800 == 1) {
         // The caches' textures and their memory (level 0, power-of-two).

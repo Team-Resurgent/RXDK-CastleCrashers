@@ -29,6 +29,10 @@ PATCHES: list[tuple[str, str, str, str]] = [
     # On one processor more workers only hold more raster buffers at once.
     ("sub_82092E28", "cr6.compare<uint32_t>(ctx.r31.u32, 5, xer);", "cr6.compare<uint32_t>(ctx.r31.u32, 1, xer);",
      "one job worker, not five"),
+    # The worker's loop packing its float raster into the texture: done in
+    # runtime/title.cpp instead (cc_raster_done), the same to the bit.
+    ("sub_820D4030", "ctx.r9.s64 = int64_t(ctx.r9.s32) * int64_t(ctx.r8.s32);", "ctx.r9.s64 = 0;",
+     "the pack loop to the runtime"),
     # A worker has drawn a job's shape into its texture (job +564, +552 by
     # +556 texels): the renderer takes it (runtime/title.cpp).
     ("sub_820D4030", "\tsub_820D4A90(ctx, base);",
