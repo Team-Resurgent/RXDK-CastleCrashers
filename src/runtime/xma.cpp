@@ -496,7 +496,7 @@ void feed_voice(Voice& v) {
     if (!f.entry)
         return;
     DWORD now = GetTickCount();
-    if (now - v.last_taken > 250) {
+    if (now - v.last_taken > 750) {
         end_feed(v);
         return;
     }

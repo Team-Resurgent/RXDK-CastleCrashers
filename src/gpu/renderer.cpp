@@ -1814,7 +1814,9 @@ void present() {
             unsigned(palette_textures.size()), palettes >> 10, unsigned(palette_pool.size()), pooled >> 10,
             unsigned(palette_sources.size()));
     }
-    debug_frame = presented % 600 == 0 || debug_requested;
+    // A frame's draws are logged only on request: logging thousands of lines
+    // over the serial port stalls the title (a hitch every few seconds).
+    debug_frame = debug_requested;
     debug_requested = false;
     // A swap with nothing drawn or resolved since the last shows the same
     // front buffer again (the title draws a still screen once): flipping

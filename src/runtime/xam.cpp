@@ -235,21 +235,6 @@ IMPORT(XamInputGetState) {
         log("xam: buttons %04X triggers %u/%u stick %d,%d at %lu ms\n", buttons, lt, rt, direction(sticks[0]),
             direction(sticks[1]), (unsigned long)GetTickCount());
     last_summary = summary;
-    // Diagnostic: A held for 300 ms logs one frame's draws (what firing draws).
-    static DWORD a_since;
-    static bool a_logged;
-    if (buttons & 0x1000) {
-        DWORD now = GetTickCount();
-        if (!a_since)
-            a_since = now;
-        if (!a_logged && now - a_since >= 300) {
-            gpu::renderer::request_debug_frame();
-            a_logged = true;
-        }
-    } else {
-        a_since = 0;
-        a_logged = false;
-    }
     uint32_t s = ctx.r5.u32;
     guest::store32(s, packet);
     guest::store16(s + 4, buttons);
