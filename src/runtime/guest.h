@@ -127,6 +127,7 @@ struct GuestThread {
     HANDLE handle = nullptr;
     uint32_t start = 0, start_context = 0, xapi_startup = 0;
     int priority = 0;
+    uint32_t spins = 0;  // its spin loops' yields (ppc_spin_yield)
     // The last import it called, from where (a host address in the
     // recompiled code), and whether it is still in it: what the watchdog
     // (kernel.cpp) reports.

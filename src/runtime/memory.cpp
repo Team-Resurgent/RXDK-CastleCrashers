@@ -371,6 +371,12 @@ void ppc_missing_function(uint32_t guest_address) {
     fatal("guest: call to %08X\n", guest_address);
 }
 
+void ppc_spin_yield() {
+    // Every 16th time a millisecond, so threads of lower priority run too.
+    GuestThread* t = current_thread();
+    Sleep(t && ++t->spins % 16 == 0 ? 1 : 0);
+}
+
 void ppc_bad_switch(uint32_t first_case, uint32_t index) {
     GuestThread* t = current_thread();
     log("guest: thread %u: index %u past the cases of the jump table whose first case is %08X\n", t ? t->id : 0,

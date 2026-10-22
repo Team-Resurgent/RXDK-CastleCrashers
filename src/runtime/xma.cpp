@@ -34,6 +34,7 @@
 
 #include <cmath>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace audio {
@@ -157,30 +158,61 @@ struct Ring {
     }
 };
 
-// --- the converted wave banks ---------------------------------------------
+// --- the converted sounds -------------------------------------------------
 
 constexpr uint32_t kFrameSamples = 512;
 constexpr uint32_t kBlockBytes = 4 + kFrameSamples / 2;  // one channel's frame: predictor, index, nibbles
 
 struct BankEntry {
-    uint32_t streams, channels, frames, rate, offset, stream_bytes, reserved[2];
+    uint32_t streams, channels, frames, offset, stream_bytes, packets, table, name, data_start, reserved;
 };
-struct PacketRecord {
-    uint32_t hash;
-    uint16_t entry;
+struct PacketInfo {
     uint8_t stream, frames;
-    uint32_t first_frame, reserved;
+    uint16_t reserved;
+    uint32_t first_frame;
 };
-static_assert(sizeof(BankEntry) == 32 && sizeof(PacketRecord) == 16, "convert_audio.py's layout");
+static_assert(sizeof(BankEntry) == 40 && sizeof(PacketInfo) == 8, "convert_audio.py's layout");
 
+// A converted bank (tools/convert_audio.py): its entries by the title's path
+// of each sound, the blocks read from the file as they are needed.
 struct Bank {
     std::vector<BankEntry> entries;
-    std::vector<PacketRecord> packets;  // by hash
+    std::map<std::string, uint32_t> by_name;
     uint32_t data_offset = 0;
-    std::vector<uint8_t> data;          // the blocks, when in memory
-    HANDLE file = INVALID_HANDLE_VALUE;  // else read from here as packets start
+    HANDLE file = INVALID_HANDLE_VALUE;
+    bool keep = false;  // effects: a sound's blocks are read whole when the title loads it
+    CRITICAL_SECTION file_lock;  // the decoder thread and the title's loads read it
 };
-std::vector<Bank> banks;
+Bank banks[2];  // effects, music
+
+// Reads [at, at + size) of the bank's blocks.
+void read_blocks(Bank& bank, uint32_t at, uint8_t* out, uint32_t size) {
+    EnterCriticalSection(&bank.file_lock);
+    DWORD read = 0;
+    SetFilePointer(bank.file, LONG(bank.data_offset + at), nullptr, FILE_BEGIN);
+    if (!ReadFile(bank.file, out, size, &read, nullptr) || read != size)
+        memset(out + read, 0, size - read);
+    LeaveCriticalSection(&bank.file_lock);
+}
+
+// A sound the title has read into memory: from start, its packets from
+// first_packet on, to end. Its blocks are kept here (effects, within
+// kKeptBytes) or read as its packets are decoded.
+struct Loaded {
+    uint32_t end, first_packet;
+    Bank* bank;
+    const BankEntry* entry;
+    std::vector<PacketInfo> packets;  // the entry's
+    std::vector<uint8_t> blocks;      // all the entry's, when kept
+    uint32_t sequence;                // when it was loaded (the oldest are dropped first)
+};
+std::map<uint32_t, Loaded> loaded;  // by guest address
+uint32_t loaded_sequence, kept_bytes;
+constexpr uint32_t kKeptBytes = 1 << 20;
+CRITICAL_SECTION loaded_lock;
+struct LoadedLockInit {
+    LoadedLockInit() { InitializeCriticalSection(&loaded_lock); }
+} loaded_lock_init;
 
 // The headers (first 4 bytes) of packets whose memory was given back
 // (runtime/io.cpp releases the sounds' XMA data as it is read): what a
@@ -191,64 +223,34 @@ struct SavedHeadersInit {
     SavedHeadersInit() { InitializeCriticalSection(&saved_headers_lock); }
 } saved_headers_init;
 
-bool load_bank(const char* path, bool in_memory) {
+bool load_bank(Bank& bank, const char* path, bool keep) {
+    InitializeCriticalSection(&bank.file_lock);
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
-        log("xma: no %s: that bank is silent\n", path);
+        log("xma: no %s: those sounds are silent\n", path);
         return false;
     }
     uint32_t header[4];
     DWORD read = 0;
-    Bank bank;
-    if (!ReadFile(f, header, sizeof(header), &read, nullptr) || read != sizeof(header) || header[0] != 0x3141504A) {
+    if (!ReadFile(f, header, sizeof(header), &read, nullptr) || read != sizeof(header) || header[0] != 0x3241504A) {
         log("xma: %s is not a converted bank\n", path);
         CloseHandle(f);
         return false;
     }
     bank.entries.resize(header[1]);
-    bank.packets.resize(header[2]);
     bank.data_offset = header[3];
     ReadFile(f, bank.entries.data(), header[1] * sizeof(BankEntry), &read, nullptr);
-    ReadFile(f, bank.packets.data(), header[2] * sizeof(PacketRecord), &read, nullptr);
-    if (in_memory) {
-        uint32_t size = GetFileSize(f, nullptr) - bank.data_offset;
-        bank.data.resize(size);
-        ReadFile(f, bank.data.data(), size, &read, nullptr);
-        CloseHandle(f);
-    } else {
-        bank.file = f;
-    }
-    log("xma: %s: %u entries, %u packets%s\n", path, header[1], header[2], in_memory ? ", in memory" : ", streamed");
-    banks.push_back(std::move(bank));
+    // The names: from the first entry's to the first packet table.
+    uint32_t names = bank.entries.empty() ? 0 : bank.entries[0].name;
+    uint32_t names_end = bank.entries.empty() ? 0 : bank.entries[0].table;
+    std::vector<char> text(names_end - names);
+    ReadFile(f, text.data(), DWORD(text.size()), &read, nullptr);
+    for (uint32_t i = 0; i < bank.entries.size(); i++)
+        bank.by_name[&text[bank.entries[i].name - names]] = i;
+    bank.file = f;
+    bank.keep = keep;
+    log("xma: %s: %u sounds\n", path, header[1]);
     return true;
-}
-
-uint32_t fnv(const uint8_t* p, uint32_t n) {
-    uint32_t h = 2166136261u;
-    for (uint32_t i = 0; i < n; i++)
-        h = (h ^ p[i]) * 16777619u;
-    return h;
-}
-
-// The bank and record of a packet the title feeds, by its bytes.
-bool find_packet(const uint8_t* packet, const Bank*& bank, const PacketRecord*& record) {
-    uint32_t hash = fnv(packet, kBytesPerPacket);
-    for (const Bank& b : banks) {
-        size_t lo = 0, hi = b.packets.size();
-        while (lo < hi) {
-            size_t mid = (lo + hi) / 2;
-            if (b.packets[mid].hash < hash)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        if (lo < b.packets.size() && b.packets[lo].hash == hash) {
-            bank = &b;
-            record = &b.packets[lo];
-            return true;
-        }
-    }
-    return false;
 }
 
 const int16_t kSteps[89] = {7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,    23,
@@ -285,10 +287,10 @@ void decode_block(const uint8_t* block, int16_t* out) {
 // volume XAudio gives the context's voice (xaudio.cpp). XAudio consumes the
 // same frames at the same rate, so the writes stay a few frames ahead; a
 // frame half a buffer ahead is silenced, so a voice that runs dry is quiet.
-constexpr uint32_t kVoiceFrames = 16;
+constexpr uint32_t kVoiceFrames = 8;
 struct Voice {
     LPDIRECTSOUNDBUFFER buffer = nullptr;
-    uint32_t channels = 0, rate = 0, frame_bytes = 0, write = 0;
+    uint32_t channels = 0, rate = 0, frame_bytes = 0, write = 0, writes = 0;
     bool playing = false;
     DWORD last_write = 0;
     // From XAudio, and what was last applied.
@@ -302,10 +304,9 @@ struct Context {
     uint8_t frame_remaining_subframes = 0;
     Voice voice;
     uint32_t output_start = 0, output_end = 0;  // guest addresses of the output buffer
-    // The packet being output: its record (null: silence), the frames of it
-    // still to decode, and its blocks (read from a streamed bank).
-    const Bank* bank = nullptr;
-    const PacketRecord* record = nullptr;
+    // The packet being output: its frames' blocks, of channels channels (0:
+    // silence), the next of them and the frames still to decode.
+    uint32_t channels = 0;
     uint32_t frame = 0, frames_left = 0;
     std::vector<uint8_t> blocks;
     // The frame being copied out, as the hardware writes it: 16-bit
@@ -380,12 +381,16 @@ void voice_write(Voice& v, const int16_t* samples, uint32_t channels, uint32_t r
         v.buffer->Play(0, 0, DSBPLAY_LOOPING);
         v.playing = true;
         voices_started++;
-    } else {
+    } else if (++v.writes % 4 == 0) {
+        // Overtaken (the voice ran dry): write just ahead of it. The play
+        // position is costly to read (the APU's): every few frames.
         DWORD play = 0, unused = 0;
         v.buffer->GetCurrentPosition(&play, &unused);
-        // Overtaken (the voice ran dry): write just ahead of it.
         if ((v.write + size - play) % size > size - 2 * frame_bytes)
             v.write = (play / frame_bytes + 1) % kVoiceFrames * frame_bytes;
+        put(v.write, samples);
+        v.write = (v.write + frame_bytes) % size;
+    } else {
         put(v.write, samples);
         v.write = (v.write + frame_bytes) % size;
     }
@@ -415,39 +420,30 @@ void update_voice(Voice& v) {
     }
 }
 
-// The current packet's next frame into c.output, for out_channels.
+// The current packet's next frame onto the context's voice, for
+// out_channels. The title's XAudio gets silence (c.output): the voice is
+// heard from the APU instead, and XAudio's own mix would double it.
 void decode_frame(Context& c, uint32_t out_channels, uint32_t rate) {
     static int16_t pcm[2][kFrameSamples], native[kFrameSamples * 2];
     uint32_t channels = 0;
-    if (c.record) {
-        const BankEntry& e = c.bank->entries[c.record->entry];
-        uint32_t frame = c.record->first_frame + c.frame;
-        if (frame < e.frames) {
-            channels = e.channels < 2 ? e.channels : 2;
-            const uint8_t* block;
-            if (c.bank->file == INVALID_HANDLE_VALUE)
-                block = &c.bank->data[e.offset + c.record->stream * e.stream_bytes + frame * e.channels * kBlockBytes];
-            else
-                block = &c.blocks[c.frame * e.channels * kBlockBytes];
-            for (uint32_t ch = 0; ch < channels; ch++)
-                decode_block(block + ch * kBlockBytes, pcm[ch]);
-        }
+    if (c.channels && (c.frame + 1) * c.channels * kBlockBytes <= c.blocks.size()) {
+        channels = c.channels < 2 ? c.channels : 2;
+        const uint8_t* block = &c.blocks[c.frame * c.channels * kBlockBytes];
+        for (uint32_t ch = 0; ch < channels; ch++)
+            decode_block(block + ch * kBlockBytes, pcm[ch]);
     }
-    uint16_t* out = reinterpret_cast<uint16_t*>(c.output);
     for (uint32_t i = 0; i < kFrameSamples; i++) {
         int left = channels ? pcm[0][i] : 0, right = channels > 1 ? pcm[1][i] : left;
         if (out_channels == 1) {
             native[i] = int16_t(channels > 1 ? (left + right) / 2 : left);
-            out[i] = __builtin_bswap16(uint16_t(native[i]));
         } else {
             native[i * 2] = int16_t(left);
             native[i * 2 + 1] = int16_t(right);
-            out[i * 2] = __builtin_bswap16(uint16_t(int16_t(left)));
-            out[i * 2 + 1] = __builtin_bswap16(uint16_t(int16_t(right)));
         }
     }
     voice_write(c.voice, native, out_channels, rate);
     c.output_size = kFrameSamples * out_channels * 2;
+    memset(c.output, 0, c.output_size);
     c.output_done = 0;
     c.frame++;
     c.frames_left--;
@@ -489,6 +485,37 @@ void update_loop_status(ContextData& data) {
     data.input_buffer_read_offset = data.loop_start / kBitsPerPacket * kBitsPerPacket + kBitsPerPacketHeader;
     if (data.loop_count != 255)
         data.loop_count = data.loop_count - 1;
+}
+
+// The packet at address, if it is of a sound the title loaded: its frames'
+// blocks into c (c.channels 0 if the sound was not converted).
+bool packet_blocks(uint32_t address, Context& c) {
+    EnterCriticalSection(&loaded_lock);
+    auto it = loaded.upper_bound(address);
+    bool found = false;
+    if (it != loaded.begin() && address < (--it)->second.end) {
+        Loaded& l = it->second;
+        uint32_t index = l.first_packet + (address - it->first) / kBytesPerPacket;
+        if (index < l.packets.size()) {
+            found = true;
+            const PacketInfo& p = l.packets[index];
+            const BankEntry& e = *l.entry;
+            c.frames_left = p.frames;
+            uint32_t frames = p.first_frame < e.frames ? e.frames - p.first_frame : 0;
+            frames = frames < p.frames ? frames : p.frames;
+            if (e.channels && frames) {
+                uint32_t at = e.offset + p.stream * e.stream_bytes + p.first_frame * e.channels * kBlockBytes;
+                c.blocks.resize(frames * e.channels * kBlockBytes);
+                if (!l.blocks.empty())
+                    memcpy(c.blocks.data(), &l.blocks[at - e.offset], c.blocks.size());
+                else
+                    read_blocks(*l.bank, at, c.blocks.data(), uint32_t(c.blocks.size()));
+                c.channels = e.channels;
+            }
+        }
+    }
+    LeaveCriticalSection(&loaded_lock);
+    return found;
 }
 
 // Starts the next frame: of the current packet while it has frames, else of
@@ -542,27 +569,10 @@ void process_packet(Context& c, ContextData& data) {
     uint32_t header_frames = (saved ? header[0] : bytes[0]) >> 2, skip = saved ? header[3] : bytes[3];
 
     c.frame = 0;
-    if (!saved && !banks.empty() && find_packet(bytes, c.bank, c.record)) {
-        c.frames_left = c.record->frames;
-        const BankEntry& e = c.bank->entries[c.record->entry];
-        if (c.bank->file != INVALID_HANDLE_VALUE) {
-            // A streamed bank: this packet's blocks from the disc.
-            uint32_t frames = c.record->first_frame < e.frames ? e.frames - c.record->first_frame : 0;
-            frames = frames < c.frames_left ? frames : c.frames_left;
-            c.blocks.resize(frames * e.channels * kBlockBytes);
-            LONG at = LONG(c.bank->data_offset + e.offset + c.record->stream * e.stream_bytes +
-                           c.record->first_frame * e.channels * kBlockBytes);
-            DWORD read = 0;
-            SetFilePointer(c.bank->file, at, nullptr, FILE_BEGIN);
-            if (!c.blocks.empty())
-                ReadFile(c.bank->file, c.blocks.data(), DWORD(c.blocks.size()), &read, nullptr);
-        }
-    } else {
-        c.bank = nullptr;
-        c.record = nullptr;
-        c.frames_left = header_frames;
+    c.frames_left = header_frames;
+    c.channels = 0;
+    if (!packet_blocks(address, c))
         unknown_packets++;
-    }
 
     uint32_t next = packet + 1 + skip;
     if (next >= packets) {
@@ -678,7 +688,7 @@ void clear(uint32_t id) {
     c.frames_left = 0;
     c.output_size = c.output_done = 0;
     c.pending_skip = 0;
-    c.record = nullptr;
+    c.channels = 0;
     stop_voice(c.voice);
     data.store(address);
 }
@@ -733,9 +743,13 @@ DWORD WINAPI decoder_thread(void*) {
             logged_stray = stray_kicks;
         }
         if ((logged_kicks == 0 && kicks) || (++passes % 10000 == 0 && kicks != logged_kicks)) {
+            uint32_t buffers = 0;
+            for (const Context& c : state)
+                buffers += c.voice.buffer != nullptr;
             log("xma: %u kicks, %u locks, %u clears, %u worked, %u packets not in the banks, %u voices started, "
-                "%u voice matches, %u misses\n",
-                kicks, locks, clears, worked, unknown_packets, voices_started, voice_matches, voice_misses);
+                "%u voice matches, %u misses; %u voice buffers, %u sounds loaded (%u KB kept)\n",
+                kicks, locks, clears, worked, unknown_packets, voices_started, voice_matches, voice_misses, buffers,
+                unsigned(loaded.size()), kept_bytes >> 10);
             logged_kicks = kicks;
         }
         Sleep(1);
@@ -820,11 +834,84 @@ void save_packet_headers(uint32_t address, uint32_t size) {
     LeaveCriticalSection(&saved_headers_lock);
 }
 
+// From runtime/io.cpp: the title has read size bytes of the sound at path
+// (D:\...) from offset into address. The whole packets read are the
+// sound's from then on, so the decoder knows them wherever the title put
+// them; an effect's blocks are read now (the title loads a level's effects
+// together, and they must start at once).
+void sound_read(const char* path, uint32_t address, uint32_t offset, uint32_t size) {
+    std::string name = path;
+    if (name.size() < 3 || _strnicmp(name.c_str(), "D:\\", 3) != 0)
+        return;
+    name = name.substr(3);
+    for (char& ch : name)
+        ch = char(tolower(uint8_t(ch)));
+    Bank* bank = nullptr;
+    const BankEntry* entry = nullptr;
+    for (Bank& b : banks) {
+        auto it = b.by_name.find(name);
+        if (it != b.by_name.end()) {
+            bank = &b;
+            entry = &b.entries[it->second];
+        }
+    }
+    if (!entry)
+        return;
+    uint32_t kDataStart = entry->data_start;  // where its packets start in the file
+    uint32_t data = offset > kDataStart ? offset - kDataStart : 0;
+    uint32_t first = (data + kBytesPerPacket - 1) / kBytesPerPacket;  // the first whole packet
+    uint32_t start = address + (kDataStart + first * kBytesPerPacket - offset);
+    if (offset + size < kDataStart + (first + 1) * kBytesPerPacket)
+        return;  // not a whole packet
+    uint32_t end = start + (offset + size - kDataStart - first * kBytesPerPacket) / kBytesPerPacket * kBytesPerPacket;
+    Loaded l;
+    l.end = end;
+    l.first_packet = first;
+    l.bank = bank;
+    l.entry = entry;
+    l.packets.resize(entry->packets);
+    EnterCriticalSection(&bank->file_lock);
+    DWORD read = 0;
+    SetFilePointer(bank->file, LONG(entry->table), nullptr, FILE_BEGIN);
+    ReadFile(bank->file, l.packets.data(), entry->packets * sizeof(PacketInfo), &read, nullptr);
+    LeaveCriticalSection(&bank->file_lock);
+    uint32_t bytes = entry->streams * entry->stream_bytes;
+    if (bank->keep && entry->channels && bytes <= kKeptBytes / 4) {
+        l.blocks.resize(bytes);
+        read_blocks(*bank, entry->offset, l.blocks.data(), bytes);
+    }
+    EnterCriticalSection(&loaded_lock);
+    // What the title loaded there before is gone.
+    for (auto it = loaded.lower_bound(start); it != loaded.end() && it->first < end;) {
+        kept_bytes -= uint32_t(it->second.blocks.size());
+        it = loaded.erase(it);
+    }
+    auto before = loaded.lower_bound(start);
+    if (before != loaded.begin() && (--before)->second.end > start) {
+        kept_bytes -= uint32_t(before->second.blocks.size());
+        loaded.erase(before);
+    }
+    l.sequence = ++loaded_sequence;
+    kept_bytes += uint32_t(l.blocks.size());
+    loaded[start] = std::move(l);
+    // Over the budget: the oldest effects' blocks go (read as they play).
+    while (kept_bytes > kKeptBytes) {
+        Loaded* oldest = nullptr;
+        for (auto& [at, s] : loaded)
+            if (!s.blocks.empty() && (!oldest || s.sequence < oldest->sequence))
+                oldest = &s;
+        if (!oldest)
+            break;
+        kept_bytes -= uint32_t(oldest->blocks.size());
+        std::vector<uint8_t>().swap(oldest->blocks);
+    }
+    LeaveCriticalSection(&loaded_lock);
+}
+
 void init() {
     InitializeCriticalSection(&lock);
-    // Effects in memory (they start at once), music read as it plays.
-    load_bank("D:\\audio\\Sfx.jpa", true);
-    load_bank("D:\\audio\\Music.jpa", false);
+    load_bank(banks[0], "D:\\audio\\Sounds.jpa", true);
+    load_bank(banks[1], "D:\\audio\\Music.jpa", false);
     contexts = guest::alloc(kContexts * kContextSize, 256);
     *reg(kContextArrayAddress) = LONG(contexts & 0x1FFFFFFF);
     *reg(kNextContextIndex) = 1;
@@ -838,16 +925,7 @@ IMPORT(XMACreateContext) {
     EnterCriticalSection(&lock);
     for (uint32_t i = 0; i < kContexts; i++) {
         if (!state[i].allocated) {
-            // The voice's DirectSound buffer is kept for the next sound.
-            Voice& old = state[i].voice;
-            stop_voice(old);
-            LPDIRECTSOUNDBUFFER buffer = old.buffer;
-            uint32_t channels = old.channels, rate = old.rate, frame_bytes = old.frame_bytes;
             state[i] = Context();
-            state[i].voice.buffer = buffer;
-            state[i].voice.channels = channels;
-            state[i].voice.rate = rate;
-            state[i].voice.frame_bytes = frame_bytes;
             state[i].allocated = true;
             context = context_address(i);
             memset(guest::host(context), 0, kContextSize);
@@ -865,7 +943,13 @@ IMPORT(XMAReleaseContext) {
         EnterCriticalSection(&lock);
         state[i].allocated = false;
         state[i].enabled = false;
-        stop_voice(state[i].voice);
+        // Its voice's buffer goes with it: the title creates far more
+        // contexts over time than play at once.
+        Voice& v = state[i].voice;
+        stop_voice(v);
+        if (v.buffer)
+            v.buffer->Release();
+        v.buffer = nullptr;
         memset(guest::host(context_address(i)), 0, kContextSize);
         LeaveCriticalSection(&lock);
     }

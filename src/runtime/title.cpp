@@ -552,6 +552,10 @@ extern "C" void cc_raster_done(PPCContext& ctx, uint32_t job) {
         guest::release(raster + guest::kPage, bytes - 2 * guest::kPage);
 }
 
+// The C library's memset (r3, the byte r4, r5 bytes; returns r3), native:
+// the rasterizer and XAudio clear large buffers with it.
+PPC_FUNC(sub_8218BC40) { memset(guest::host(ctx.r3.u32), int(ctx.r4.u32 & 0xFF), ctx.r5.u32); }
+
 // Whether every job worker is idle and no job is queued: the main thread
 // polls it while the workers rasterize. On one processor its spinning takes
 // the time the workers need, so it sleeps between polls.

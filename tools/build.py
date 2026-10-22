@@ -154,6 +154,12 @@ def main() -> int:
     if not mapping.exists() or any(p.stat().st_mtime > mapping.stat().st_mtime for p in inputs):
         recompile(ppc)
     run([sys.executable, ROOT / "tools/gen_stubs.py", ppc, ROOT / "src/runtime"])
+    # The sounds decoded and stored as ADPCM, once (needs ffmpeg).
+    audio = BUILD / "audio"
+    if not all((audio / bank).exists() for bank in ("Sounds.jpa", "Music.jpa")):
+        if not shutil.which("ffmpeg"):
+            sys.exit("build: the sounds are converted with ffmpeg (its xma2 decoder): install it and put it on PATH")
+        run([sys.executable, ROOT / "tools/convert_audio.py", PACKAGE, UPDATE, audio])
     run([sys.executable, ROOT / "tools/gen_project.py"])
     # The RXDK build leaves staged files that left the manifest: a test input
     # script must not stay on the disc once build/inputs.txt is gone.

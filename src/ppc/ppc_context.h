@@ -150,6 +150,10 @@ struct PPCBase
 // named by its first case.
 [[noreturn]] void ppc_bad_switch(uint32_t first_case, uint32_t index);
 
+// A spin loop's db16cyc (tools/postprocess.py): the 360 runs the thread it
+// waits for on another hardware thread, here it must get the processor.
+void ppc_spin_yield();
+
 #ifndef PPC_CALL_INDIRECT_FUNC
 // A call through a function pointer (bctrl): to a function the recompiler did
 // not find, the runtime reports the address (ppc_missing_function) instead of

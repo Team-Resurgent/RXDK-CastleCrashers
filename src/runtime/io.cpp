@@ -15,6 +15,7 @@
 // The XMA decoder (xma.cpp).
 namespace xma {
 void save_packet_headers(uint32_t address, uint32_t size);
+void sound_read(const char* path, uint32_t address, uint32_t offset, uint32_t size);
 }  // namespace xma
 
 namespace {
@@ -248,12 +249,15 @@ IMPORT(NtReadFile) {
                 ctx.r10.u32 ? (unsigned long long)guest::load64(ctx.r10.u32) : 0ull, path_of(h).c_str());
     }
     uint32_t status = read == 0 && ctx.r9.u32 ? kEndOfFile : kSuccess;
-    // A sound's XMA data (the headers come in small reads before it): only
-    // the XMA decoder reads it, and it plays silence until sound is done,
-    // so its memory goes back. 64 MB does not hold every sound effect too.
-    if (read >= 2 * guest::kPage) {
-        std::string path = path_of(h);
-        if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".xma") == 0) {
+    // A sound's XMA data: the XMA decoder plays it from the converted sounds
+    // (tools/convert_audio.py) by the file it came from, and needs only the
+    // packets' headers of it, so its memory goes back. 64 MB does not hold
+    // every sound effect too.
+    std::string path = read ? path_of(h) : std::string();
+    if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".xma") == 0) {
+        uint32_t offset = SetFilePointer(h, 0, nullptr, FILE_CURRENT) - read;
+        xma::sound_read(path.c_str(), ctx.r8.u32, offset, read);
+        if (read >= 2 * guest::kPage) {
             xma::save_packet_headers(ctx.r8.u32, read);
             guest::release(ctx.r8.u32, read);
         }

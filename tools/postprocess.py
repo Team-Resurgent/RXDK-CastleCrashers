@@ -12,6 +12,10 @@ bounds it, and an index past its cases reports the switch (ppc_bad_switch)
 instead of reaching __builtin_unreachable(): a table found with too few
 cases would jump anywhere.
 
+A spin loop's db16cyc (a hint to the processor, nothing in the generated
+code) yields the processor instead (ppc_spin_yield): on the 360 the thread
+it waits for runs on another hardware thread.
+
 PATCHES change the title itself for the original Xbox: each replaces one
 exact line in one function, and the build fails if the line is not there.
 Files are rewritten in place, and only when they change.
@@ -39,6 +43,9 @@ PATCHES: list[tuple[str, str, str, str]] = [
      "\t{ extern void cc_raster_done(PPCContext&, uint32_t); cc_raster_done(ctx, ctx.r31.u32); }\n"
      "\tsub_820D4A90(ctx, base);", "the rasterized texture to the renderer"),
 ]
+
+# A spin loop's hint to the processor: a yield here (ppc_spin_yield).
+SPIN = "\t// db16cyc \n"
 
 SWITCH =re.compile(r"\tswitch \(ctx\.(r\d+)\.u64\) \{\n\tcase 0:\n\t\tgoto loc_([0-9A-F]+);")
 UNREACHABLE = "\tdefault:\n\t\t__builtin_unreachable();"
@@ -119,6 +126,8 @@ def main() -> int:
         text = path.read_text()
         new, count = rewrite(text)
         new, n = rewrite_switches(new)
+        if SPIN + "\tppc_spin_yield();" not in new:
+            new = new.replace(SPIN, SPIN + "\tppc_spin_yield();\n")
         new = apply_patches(new, applied)
         if new != text:
             path.write_text(new)
