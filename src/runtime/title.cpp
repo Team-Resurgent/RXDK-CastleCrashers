@@ -41,8 +41,6 @@ uint32_t jobs;
             job_end = t1;                                    \
     }
 TIMED(sub_820D6258, kJob)
-TIMED(sub_820D4EA8, kScanline)
-TIMED(sub_820D51A8, kBlend)
 
 namespace {
 
@@ -501,13 +499,11 @@ PPC_FUNC(sub_820D5C80) {
 
 // The solid fill's span.
 PPC_FUNC(sub_820D5220) {
-    uint64_t t0 = __builtin_ia32_rdtsc();
+    // Not timed: millions of calls, most of a few texels.
     span(ctx, base, __imp__sub_820D5220, "solid span", 0,
          [](PPCContext& c, uint32_t raster, uint32_t fill, int32_t y, int32_t x0, int32_t x1) {
              solid_span(c, raster, fill, y, x0, x1);
          });
-    timed_cycles[kSolid] += __builtin_ia32_rdtsc() - t0;
-    timed_calls[kSolid]++;
 }
 
 // A worker has drawn a job's shape into its texture (tools/postprocess.py
@@ -545,11 +541,14 @@ extern "C" void cc_raster_done(PPCContext& ctx, uint32_t job) {
             guest::store32(texture + i * 4, texels[i]);
     }
     // The job's raster (+568, 16 bytes a texel: four floats) is freed next.
-    // Its pages go back now but the first and last, where the arena keeps
-    // its block headers; reused, they are zeroed pages again.
+    // Its pages past the first kKeptRaster go back now, but the last (the
+    // arena keeps its block headers there): the next job's raster, at the
+    // same place and cleared whole with memset, would fault each page back
+    // in, which costs more than the clear. Most rasters fit in the part kept.
+    constexpr uint32_t kKeptRaster = 1 << 20;
     uint32_t raster = guest::load32(job + 568), bytes = width * height * 16;
-    if (bytes > 2 * guest::kPage)
-        guest::release(raster + guest::kPage, bytes - 2 * guest::kPage);
+    if (bytes > kKeptRaster + guest::kPage)
+        guest::release(raster + kKeptRaster, bytes - kKeptRaster - guest::kPage);
 }
 
 // The C library's memset (r3, the byte r4, r5 bytes; returns r3), native:
