@@ -6,6 +6,8 @@
   gamecode/rxdk.project.json  the recompiled title (build/ppc), from the
                               user's own default.xex: its own library, so
                               runtime changes never recompile it
+  gamecode_hot/...            the generated files with its hottest code,
+                              built for speed rather than size
 """
 from __future__ import annotations
 
@@ -25,6 +27,10 @@ FLAGS = ["-fno-strict-overflow", "-Wno-unused-label", "-Wno-unused-variable", "-
 # ring of recent calls (ppc_context.h), for a crash's call chain. Slower:
 # set CC_CALL_TRACE=1 to build with it.
 DEFINES = ["PPC_CALL_TRACE"] if os.environ.get("CC_CALL_TRACE") == "1" else []
+# The generated files with the title's hottest code, built at -O2 (the rest
+# at -Os): on a development kit, sampling gameplay put half of the time in
+# them (the 2D scene's transforms and display lists, 820A0000 on).
+HOT = {"ppc_recomp.2.cpp", "ppc_recomp.3.cpp", "ppc_recomp.5.cpp", "ppc_recomp.9.cpp", "ppc_recomp.10.cpp"}
 # The package's data folders, deployed to D:\ as they are.
 DATA = ["art", "bsps", "fonts", "game", "levels", "music", "shaders", "sounds"]
 
@@ -48,16 +54,18 @@ def main() -> int:
     if len(code) < 2:
         raise SystemExit(f"recompile the title first: nothing in {PPC}")
     includes = [PPC, ROOT / "src/ppc", SIMDE]
-    gamecode = ROOT / "gamecode"
-    write(gamecode, {
-        "name": "gamecode", "type": "library", "configuration": "release",
-        "sources": [rel(p, gamecode) for p in code],
-        "includePaths": [rel(p, gamecode) for p in includes],
-        # -Os after RXDK's -O3: the generated code is most of the XBE, and
-        # 64 MB holds the title only with the XBE small.
-        "defines": DEFINES,
-        "compileFlags": FLAGS + ["-Os"],
-        "cppStandard": "c++20", "outputDir": "out"})
+    # -Os after RXDK's -O3: the generated code is most of the XBE, and 64 MB
+    # holds the title only with the XBE small. The hot files at -O2.
+    for name, sources, level in [("gamecode", [p for p in code if p.name not in HOT], "-Os"),
+                                 ("gamecode_hot", [p for p in code if p.name in HOT], "-O2")]:
+        directory = ROOT / name
+        write(directory, {
+            "name": name, "type": "library", "configuration": "release",
+            "sources": [rel(p, directory) for p in sources],
+            "includePaths": [rel(p, directory) for p in includes],
+            "defines": DEFINES,
+            "compileFlags": FLAGS + [level],
+            "cppStandard": "c++20", "outputDir": "out"})
 
     runtime = sorted((ROOT / "src/runtime").glob("*.cpp")) + sorted((ROOT / "src/gpu").rglob("*.cpp"))
     sources = [ROOT / "src/main.cpp"] + runtime + [PPC / "ppc_import_stubs.cpp"]
@@ -65,7 +73,7 @@ def main() -> int:
         "name": "castlecrashers", "configuration": "release",
         "sources": [rel(p, ROOT) for p in sources],
         "includePaths": [rel(p, ROOT) for p in [ROOT / "src"] + includes],
-        "projectReferences": ["gamecode"],
+        "projectReferences": ["gamecode", "gamecode_hot"],
         "libraries": LIBRARIES,
         "defines": DEFINES,
         "compileFlags": FLAGS,

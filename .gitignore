@@ -3,6 +3,7 @@
 /build/
 /out/
 /gamecode/
+/gamecode_hot/
 /rxdk.project.json
 # Fetched by tools/build.py.
 /extern/

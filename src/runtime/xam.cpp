@@ -226,12 +226,14 @@ IMPORT(XamInputGetState) {
         ctx.r3.u64 = kErrorDeviceNotConnected;
         return;
     }
-    // Logged on change: buttons, triggers and the left stick's direction.
+    // Logged on change: buttons, triggers and the left stick's direction. The
+    // first changes only: a line costs the title time (over the serial port,
+    // or the debug monitor on a development kit).
     auto direction = [](int16_t v) { return v > 8000 ? 1 : v < -8000 ? -1 : 0; };
     uint32_t summary = buttons | (lt > 30 ? 0x10000 : 0) | (rt > 30 ? 0x20000 : 0) |
                        ((direction(sticks[0]) & 3) << 18) | ((direction(sticks[1]) & 3) << 20);
-    static uint32_t last_summary;
-    if (summary != last_summary)
+    static uint32_t last_summary, changes;
+    if (summary != last_summary && changes++ < 40)
         log("xam: buttons %04X triggers %u/%u stick %d,%d at %lu ms\n", buttons, lt, rt, direction(sticks[0]),
             direction(sticks[1]), (unsigned long)GetTickCount());
     last_summary = summary;

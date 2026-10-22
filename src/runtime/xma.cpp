@@ -185,14 +185,19 @@ struct Bank {
 };
 Bank banks[2];  // effects, music
 
+DWORD longest_read;  // statistics: the longest read_blocks, in ms
+
 // Reads [at, at + size) of the bank's blocks.
 void read_blocks(Bank& bank, uint32_t at, uint8_t* out, uint32_t size) {
+    DWORD start = GetTickCount();
     EnterCriticalSection(&bank.file_lock);
     DWORD read = 0;
     SetFilePointer(bank.file, LONG(bank.data_offset + at), nullptr, FILE_BEGIN);
     if (!ReadFile(bank.file, out, size, &read, nullptr) || read != size)
         memset(out + read, 0, size - read);
     LeaveCriticalSection(&bank.file_lock);
+    DWORD took = GetTickCount() - start;
+    longest_read = took > longest_read ? took : longest_read;
 }
 
 // A sound the title has read into memory: from start, its packets from
@@ -896,7 +901,12 @@ uint32_t take_group(uint32_t first, Action action) {
 DWORD WINAPI decoder_thread(void*) {
     uint32_t next = 1, passes = 0;
     uint32_t logged_kicks = 0, logged_stray = 0;
+    // Statistics: the longest pass and the longest time between two, in ms.
+    DWORD last_end = GetTickCount(), longest_pass = 0, longest_gap = 0, last_stats = last_end;
+    uint32_t dry_logged = 0;
     for (;;) {
+        DWORD pass_start = GetTickCount();
+        longest_gap = pass_start - last_end > longest_gap ? pass_start - last_end : longest_gap;
         EnterCriticalSection(&lock);
         // CurrentContextIndex rotates on read on the hardware: the context
         // being processed. The title's lock waits while it names a context
@@ -924,7 +934,23 @@ DWORD WINAPI decoder_thread(void*) {
             feed_voice(s.voice);
             update_voice(s.voice);
         }
+        uint32_t playing = 0;
+        for (auto& [address, s] : sources)
+            playing += s.voice.playing;
         LeaveCriticalSection(&lock);
+        last_end = GetTickCount();
+        longest_pass = last_end - pass_start > longest_pass ? last_end - pass_start : longest_pass;
+        if (last_end - last_stats >= 5000) {
+            // Every 5 s: whether the voices kept ahead of the APU.
+            log("xma: %u voices playing, %u ran dry, writes at least %d frames ahead; longest pass %u ms, gap %u "
+                "ms, read %u ms\n",
+                playing, voices_dry - dry_logged, least_lead == ~0u ? -1 : int(least_lead), longest_pass,
+                longest_gap, longest_read);
+            dry_logged = voices_dry;
+            least_lead = ~0u;
+            longest_pass = longest_gap = longest_read = 0;
+            last_stats = last_end;
+        }
 
         if (stray_kicks != logged_stray) {
             log("xma: %u kicks of contexts not allocated\n", stray_kicks);

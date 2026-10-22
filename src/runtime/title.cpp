@@ -624,6 +624,7 @@ bool raster_copy(PPCContext& ctx, PPCBase base, const std::vector<uint8_t>& copy
         ctx = saved;
         return false;
     }
+    guest::touch(raster, bytes);
     memset(guest::host(raster), 0, bytes);
     // As the worker's loop leaves the description before 820D4968: its
     // vtable (the spans' dispatch, 820D4EA8's) and +28 to +40 cleared.
@@ -832,7 +833,14 @@ extern "C" void cc_raster_done(PPCContext& ctx, uint32_t job) {
 
 // The C library's memset (r3, the byte r4, r5 bytes; returns r3), native:
 // the rasterizer and XAudio clear large buffers with it.
-PPC_FUNC(sub_8218BC40) { memset(guest::host(ctx.r3.u32), int(ctx.r4.u32 & 0xFF), ctx.r5.u32); }
+// The title's memset. The pages of a large clear are given memory first, all
+// at once: touching each would fault, and on a development kit every fault
+// goes through the debug monitor (a level's load cleared thousands).
+PPC_FUNC(sub_8218BC40) {
+    if (ctx.r5.u32 >= 2 * guest::kPage)
+        guest::touch(ctx.r3.u32, ctx.r5.u32);
+    memset(guest::host(ctx.r3.u32), int(ctx.r4.u32 & 0xFF), ctx.r5.u32);
+}
 
 // Whether every job worker is idle and no job is queued: the main thread
 // polls it while the workers rasterize. On one processor its spinning takes

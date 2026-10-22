@@ -563,7 +563,9 @@ IMPORT(KeSetAffinityThread) {
 IMPORT(KeSetBasePriorityThread) {
     HANDLE thread = host_object(ctx.r3.u32);
     int old = GetThreadPriority(thread);
-    log("kernel: a thread asks for priority %d\n", int(ctx.r4.s32));
+    static int said;  // the title asks often: the first few
+    if (said++ < 10)
+        log("kernel: a thread asks for priority %d\n", int(ctx.r4.s32));
     SetThreadPriority(thread, host_priority(ctx.r4.s32));
     ctx.r3.u64 = uint64_t(int64_t(old));
 }
