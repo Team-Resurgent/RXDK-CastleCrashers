@@ -9,13 +9,13 @@
  */
 
 // The XMA decoder. The Pentium III cannot decode XMA in real time, so the
-// title's wave banks are decoded when the title is built
-// (tools/convert_audio.py: D:\audio\<bank>.jpa, IMA ADPCM in blocks of one
-// XMA frame). A context here consumes its input packets as the hardware does
-// (frames per packet, skip counts, loops) and, for each packet, finds it in
-// the converted banks by its bytes' hash and writes that packet's frames to
-// the output buffer: the voice is heard, and lasts as long as on the 360. A
-// packet that is not found gives silence.
+// title's sounds are decoded when the title is built
+// (tools/convert_audio.py: D:\audio\Sounds.jpa and Music.jpa, IMA ADPCM in
+// blocks of one XMA frame). A context here consumes its input packets as the
+// hardware does (frames per packet, skip counts, loops) and outputs silence
+// for XAudio, so its voices last as long as on the 360. Each packet is found
+// in the sound the title read it from (sound_read), and the context's voice
+// on the APU plays that sound from there, read ahead of where it plays.
 //
 // Ported from Xenia (src/xenia/apu/xma_decoder.cc for the registers,
 // src/xenia/apu/xma_context.h for the context layout and
@@ -282,17 +282,42 @@ void decode_block(const uint8_t* block, int16_t* out) {
     }
 }
 
-// A context's voice on the APU: a looping DirectSound buffer its decoded
-// frames are written into as they are decoded, which plays at the pitch and
-// volume XAudio gives the context's voice (xaudio.cpp). XAudio consumes the
-// same frames at the same rate, so the writes stay a few frames ahead; a
-// frame half a buffer ahead is silenced, so a voice that runs dry is quiet.
-constexpr uint32_t kVoiceFrames = 8;
+// A context's voice on the APU: a looping DirectSound buffer the context's
+// sound is written into ahead of where it plays, straight from the
+// converted sound (its Feed), so it plays smoothly at the rate and volume
+// XAudio gives the context's voice (xaudio.cpp) whether or not XAudio keeps
+// up with real time. XAudio takes the context's output (silence) as it
+// would the sound, which keeps its voices' timing for the title.
+constexpr uint32_t kVoiceFrames = 32;
+// Frames kept written ahead of the play position. A voice starts once that
+// many are written (or all of a shorter sound), and a frame half a buffer
+// ahead of the writes is silenced, so a voice that runs out is quiet.
+constexpr uint32_t kLeadFrames = 12;
+
+// What a voice plays: a converted sound's stream from frame next on, looping
+// from loop_end back to loop_start when the context loops (loop_end 0: it
+// does not).
+struct Feed {
+    Bank* bank = nullptr;
+    const BankEntry* entry = nullptr;  // null: none
+    uint32_t key = 0;                  // the loaded sound's guest address (for its kept blocks)
+    uint32_t stream = 0, next = 0, loop_start = 0, loop_end = 0, wraps = 0;
+    uint32_t out_channels = 0, rate = 0;
+    // Blocks read ahead from the bank: frames cache_first on.
+    std::vector<uint8_t> cache;
+    uint32_t cache_first = 0, cache_count = 0;
+};
+
 struct Voice {
     LPDIRECTSOUNDBUFFER buffer = nullptr;
-    uint32_t channels = 0, rate = 0, frame_bytes = 0, write = 0, writes = 0;
+    uint32_t channels = 0, rate = 0, frame_bytes = 0, write = 0;
+    uint32_t primed = 0;  // frames written before it plays
     bool playing = false;
-    DWORD last_write = 0;
+    // When it last had a frame written, and when the title last took a
+    // frame of its context.
+    DWORD last_write = 0, last_taken = 0;
+    uint32_t passes = 0;  // decoder passes, to read the play position every few
+    Feed feed;
     // From XAudio, and what was last applied.
     volatile float ratio = 0, gain = 1;
     float applied_ratio = -1, applied_gain = -1;
@@ -304,24 +329,41 @@ struct Context {
     uint8_t frame_remaining_subframes = 0;
     Voice voice;
     uint32_t output_start = 0, output_end = 0;  // guest addresses of the output buffer
-    // The packet being output: its frames' blocks, of channels channels (0:
-    // silence), the next of them and the frames still to decode.
-    uint32_t channels = 0;
-    uint32_t frame = 0, frames_left = 0;
-    std::vector<uint8_t> blocks;
-    // The frame being copied out, as the hardware writes it: 16-bit
-    // big-endian samples, interleaved when stereo.
+    // The packet being output: the frames of it still to output. And the
+    // first frame of the last packet found in a converted sound, with the
+    // feed's loops seen then (to tell its loops from the title's seeks).
+    uint32_t frames_left = 0;
+    uint32_t taken_frame = 0, wraps_seen = 0;
+    // The frame being copied out (silence), as the hardware writes it.
     uint8_t output[kFrameSamples * 2 * 2];
     uint32_t output_size = 0, output_done = 0;
     uint32_t pending_skip = 0;  // packets still to skip in the next buffer
 };
 
 uint32_t voices_started, voice_matches, voice_misses;  // statistics
+// Statistics: voices found run out, and the fewest frames a voice's writes
+// were ahead of its play position.
+uint32_t voices_dry, least_lead = ~0u;
 
 void stop_voice(Voice& v) {
     if (v.buffer && v.playing)
         v.buffer->Stop();
     v.playing = false;
+    v.primed = 0;
+}
+
+void end_feed(Voice& v) {
+    stop_voice(v);
+    v.feed.entry = nullptr;
+    std::vector<uint8_t>().swap(v.feed.cache);
+    v.feed.cache_count = 0;
+}
+
+void start_voice(Voice& v) {
+    v.buffer->SetCurrentPosition(0);
+    v.buffer->Play(0, 0, DSBPLAY_LOOPING);
+    v.playing = true;
+    voices_started++;
 }
 
 // A decoded frame (512 samples x channels, little-endian) onto the voice.
@@ -371,42 +413,116 @@ void voice_write(Voice& v, const int16_t* samples, uint32_t channels, uint32_t r
             v.buffer->Unlock(p1, n1, p2, n2);
         }
     };
-    if (!v.playing) {
+    if (!v.playing && !v.primed) {
         // From the start of the buffer, the rest silent.
         for (uint32_t f = 1; f < kVoiceFrames; f++)
             put(f * frame_bytes, nullptr);
-        put(0, samples);
-        v.write = frame_bytes;
-        v.buffer->SetCurrentPosition(0);
-        v.buffer->Play(0, 0, DSBPLAY_LOOPING);
-        v.playing = true;
-        voices_started++;
-    } else if (++v.writes % 4 == 0) {
-        // Overtaken (the voice ran dry): write just ahead of it. The play
-        // position is costly to read (the APU's): every few frames.
-        DWORD play = 0, unused = 0;
-        v.buffer->GetCurrentPosition(&play, &unused);
-        if ((v.write + size - play) % size > size - 2 * frame_bytes)
-            v.write = (play / frame_bytes + 1) % kVoiceFrames * frame_bytes;
-        put(v.write, samples);
-        v.write = (v.write + frame_bytes) % size;
-    } else {
-        put(v.write, samples);
-        v.write = (v.write + frame_bytes) % size;
+        v.write = 0;
     }
+    put(v.write, samples);
+    v.write = (v.write + frame_bytes) % size;
     put((v.write + size / 2) % size, nullptr);
     v.last_write = GetTickCount();
+    if (!v.playing && ++v.primed >= kLeadFrames)
+        start_voice(v);
 }
 
-// XAudio's pitch and volume onto the APU; voices that stopped getting frames
-// stop.
+// Frames the voice's writes are ahead of where it plays. One that ran out
+// (the play position passed the writes) is written to just ahead of it.
+uint32_t voice_lead(Voice& v) {
+    uint32_t size = kVoiceFrames * v.frame_bytes;
+    DWORD play = 0, unused = 0;
+    v.buffer->GetCurrentPosition(&play, &unused);
+    uint32_t lead = (v.write + size - play) % size;
+    if (lead > size / 2) {
+        v.write = (play / v.frame_bytes + 1) % kVoiceFrames * v.frame_bytes;
+        voices_dry++;
+        return 1;
+    }
+    lead /= v.frame_bytes;
+    least_lead = lead < least_lead ? lead : least_lead;
+    return lead;
+}
+
+// The feed's frame next onto its voice, read from its sound.
+void feed_frame(Voice& v) {
+    Feed& f = v.feed;
+    const BankEntry& e = *f.entry;
+    uint32_t block_bytes = e.channels * kBlockBytes;
+    if (f.next < f.cache_first || f.next >= f.cache_first + f.cache_count) {
+        // Sixteen frames on, from the kept blocks or the disc.
+        uint32_t count = e.frames - f.next < 16 ? e.frames - f.next : 16;
+        uint32_t at = e.offset + f.stream * e.stream_bytes + f.next * block_bytes;
+        f.cache.resize(count * block_bytes);
+        bool kept = false;
+        EnterCriticalSection(&loaded_lock);
+        auto it = loaded.find(f.key);
+        if (it != loaded.end() && it->second.entry == f.entry && !it->second.blocks.empty()) {
+            memcpy(f.cache.data(), &it->second.blocks[at - e.offset], f.cache.size());
+            kept = true;
+        }
+        LeaveCriticalSection(&loaded_lock);
+        if (!kept)
+            read_blocks(*f.bank, at, f.cache.data(), uint32_t(f.cache.size()));
+        f.cache_first = f.next;
+        f.cache_count = count;
+    }
+    static int16_t pcm[2][kFrameSamples], native[kFrameSamples * 2];
+    const uint8_t* block = &f.cache[(f.next - f.cache_first) * block_bytes];
+    uint32_t channels = e.channels < 2 ? e.channels : 2;
+    for (uint32_t ch = 0; ch < channels; ch++)
+        decode_block(block + ch * kBlockBytes, pcm[ch]);
+    for (uint32_t i = 0; i < kFrameSamples; i++) {
+        int left = pcm[0][i], right = channels > 1 ? pcm[1][i] : left;
+        if (f.out_channels == 1) {
+            native[i] = int16_t(channels > 1 ? (left + right) / 2 : left);
+        } else {
+            native[i * 2] = int16_t(left);
+            native[i * 2 + 1] = int16_t(right);
+        }
+    }
+    voice_write(v, native, f.out_channels, f.rate);
+    if (++f.next >= f.loop_end && f.loop_end) {
+        f.next = f.loop_start;
+        f.wraps++;
+    }
+}
+
+// A decoder pass's writes to the voice: kLeadFrames ahead of where it plays.
+// It stops when the title stops taking its context's output (the sound was
+// stopped or paused) or when its sound has played out.
+void feed_voice(Voice& v) {
+    Feed& f = v.feed;
+    if (!f.entry)
+        return;
+    DWORD now = GetTickCount();
+    if (now - v.last_taken > 250) {
+        end_feed(v);
+        return;
+    }
+    auto more = [&] { return f.next < f.entry->frames; };
+    if (!v.playing) {
+        while (!v.playing && more())
+            feed_frame(v);
+        if (!v.playing && v.primed && v.buffer)
+            start_voice(v);  // a sound shorter than the lead: all written
+        return;
+    }
+    if (!more()) {
+        if (now - v.last_write > 200)
+            end_feed(v);  // played out
+        return;
+    }
+    if (++v.passes % 2)
+        return;  // the play position is costly to read (the APU's)
+    for (uint32_t lead = voice_lead(v); lead < kLeadFrames && more(); lead++)
+        feed_frame(v);
+}
+
+// XAudio's pitch and volume onto the APU.
 void update_voice(Voice& v) {
     if (!v.playing)
         return;
-    if (GetTickCount() - v.last_write > 250) {
-        stop_voice(v);
-        return;
-    }
     float ratio = v.ratio, gain = v.gain;
     if (ratio > 0 && (ratio < v.applied_ratio * 0.998f || ratio > v.applied_ratio * 1.002f)) {
         DWORD hz = DWORD(ratio * 48000.0f);
@@ -420,33 +536,14 @@ void update_voice(Voice& v) {
     }
 }
 
-// The current packet's next frame onto the context's voice, for
-// out_channels. The title's XAudio gets silence (c.output): the voice is
-// heard from the APU instead, and XAudio's own mix would double it.
-void decode_frame(Context& c, uint32_t out_channels, uint32_t rate) {
-    static int16_t pcm[2][kFrameSamples], native[kFrameSamples * 2];
-    uint32_t channels = 0;
-    if (c.channels && (c.frame + 1) * c.channels * kBlockBytes <= c.blocks.size()) {
-        channels = c.channels < 2 ? c.channels : 2;
-        const uint8_t* block = &c.blocks[c.frame * c.channels * kBlockBytes];
-        for (uint32_t ch = 0; ch < channels; ch++)
-            decode_block(block + ch * kBlockBytes, pcm[ch]);
-    }
-    for (uint32_t i = 0; i < kFrameSamples; i++) {
-        int left = channels ? pcm[0][i] : 0, right = channels > 1 ? pcm[1][i] : left;
-        if (out_channels == 1) {
-            native[i] = int16_t(channels > 1 ? (left + right) / 2 : left);
-        } else {
-            native[i * 2] = int16_t(left);
-            native[i * 2 + 1] = int16_t(right);
-        }
-    }
-    voice_write(c.voice, native, out_channels, rate);
+// The current packet's next frame of output: silence, which XAudio takes as
+// it would the sound (the voice is heard from the APU).
+void decode_frame(Context& c, uint32_t out_channels) {
     c.output_size = kFrameSamples * out_channels * 2;
     memset(c.output, 0, c.output_size);
     c.output_done = 0;
-    c.frame++;
     c.frames_left--;
+    c.voice.last_taken = GetTickCount();
 }
 
 uint32_t contexts;  // guest address of the array
@@ -487,35 +584,57 @@ void update_loop_status(ContextData& data) {
         data.loop_count = data.loop_count - 1;
 }
 
-// The packet at address, if it is of a sound the title loaded: its frames'
-// blocks into c (c.channels 0 if the sound was not converted).
-bool packet_blocks(uint32_t address, Context& c) {
+// A packet of a sound the title loaded: the sound, its packet's stream,
+// first frame and frames, and the loaded sound's guest address.
+struct PacketRef {
+    Bank* bank;
+    const BankEntry* entry;
+    uint32_t key, stream, first_frame, frames;
+};
+
+bool find_packet(uint32_t address, PacketRef& out) {
     EnterCriticalSection(&loaded_lock);
     auto it = loaded.upper_bound(address);
     bool found = false;
     if (it != loaded.begin() && address < (--it)->second.end) {
-        Loaded& l = it->second;
+        const Loaded& l = it->second;
         uint32_t index = l.first_packet + (address - it->first) / kBytesPerPacket;
         if (index < l.packets.size()) {
-            found = true;
             const PacketInfo& p = l.packets[index];
-            const BankEntry& e = *l.entry;
-            c.frames_left = p.frames;
-            uint32_t frames = p.first_frame < e.frames ? e.frames - p.first_frame : 0;
-            frames = frames < p.frames ? frames : p.frames;
-            if (e.channels && frames) {
-                uint32_t at = e.offset + p.stream * e.stream_bytes + p.first_frame * e.channels * kBlockBytes;
-                c.blocks.resize(frames * e.channels * kBlockBytes);
-                if (!l.blocks.empty())
-                    memcpy(c.blocks.data(), &l.blocks[at - e.offset], c.blocks.size());
-                else
-                    read_blocks(*l.bank, at, c.blocks.data(), uint32_t(c.blocks.size()));
-                c.channels = e.channels;
-            }
+            out = {l.bank, l.entry, it->first, p.stream, p.first_frame, p.frames};
+            found = true;
         }
     }
     LeaveCriticalSection(&loaded_lock);
     return found;
+}
+
+// The context's voice plays its sound from the packet p on (the title
+// started it, or moved it elsewhere). When the context loops, so does the
+// voice: between the frames its loop points' packets start and end at.
+void start_feed(Context& c, const ContextData& data, uint32_t buffer, const PacketRef& p) {
+    static const uint32_t kRates[4] = {24000, 32000, 44100, 48000};
+    Voice& v = c.voice;
+    end_feed(v);
+    Feed& f = v.feed;
+    f.bank = p.bank;
+    f.entry = p.entry;
+    f.key = p.key;
+    f.stream = p.stream;
+    f.next = p.first_frame;
+    f.loop_start = f.loop_end = 0;
+    f.out_channels = data.is_stereo ? 2 : 1;
+    f.rate = kRates[data.sample_rate];
+    PacketRef start, end;
+    if (data.loop_count && data.loop_end > data.loop_start &&
+        find_packet(buffer + data.loop_start / kBitsPerPacket * kBytesPerPacket, start) &&
+        find_packet(buffer + data.loop_end / kBitsPerPacket * kBytesPerPacket, end) && start.entry == p.entry &&
+        end.entry == p.entry) {
+        f.loop_start = start.first_frame;
+        f.loop_end = end.first_frame + end.frames;
+    }
+    v.last_taken = GetTickCount();
+    c.wraps_seen = f.wraps;
 }
 
 // Starts the next frame: of the current packet while it has frames, else of
@@ -526,10 +645,8 @@ void process_packet(Context& c, ContextData& data) {
     if (c.output_done < c.output_size)
         return;  // the current frame is not all out yet
     uint32_t out_channels = data.is_stereo ? 2 : 1;
-    static const uint32_t kRates[4] = {24000, 32000, 44100, 48000};
-    uint32_t rate = kRates[data.sample_rate];
     if (c.frames_left) {
-        decode_frame(c, out_channels, rate);
+        decode_frame(c, out_channels);
         return;
     }
     // No available data.
@@ -568,11 +685,25 @@ void process_packet(Context& c, ContextData& data) {
     }
     uint32_t header_frames = (saved ? header[0] : bytes[0]) >> 2, skip = saved ? header[3] : bytes[3];
 
-    c.frame = 0;
     c.frames_left = header_frames;
-    c.channels = 0;
-    if (!packet_blocks(address, c))
+    PacketRef p;
+    if (find_packet(address, p)) {
+        c.frames_left = p.frames;
+        // The voice is ahead of the title. It starts over where the title is
+        // for another sound, when the title is ahead of it (it ran out), or
+        // when the title went back other than by one of the voice's loops.
+        const Feed& f = c.voice.feed;
+        bool looped = p.first_frame < c.taken_frame && f.wraps > c.wraps_seen;
+        if (looped)
+            c.wraps_seen++;
+        uint32_t ahead = f.next + (f.wraps - c.wraps_seen) * (f.loop_end - f.loop_start);
+        if (p.entry->channels && (f.entry != p.entry || f.stream != p.stream || p.first_frame > ahead + 2 ||
+                                  (p.first_frame < c.taken_frame && !looped)))
+            start_feed(c, data, translate_physical(buffer), p);
+        c.taken_frame = p.first_frame;
+    } else {
         unknown_packets++;
+    }
 
     uint32_t next = packet + 1 + skip;
     if (next >= packets) {
@@ -582,7 +713,7 @@ void process_packet(Context& c, ContextData& data) {
         data.input_buffer_read_offset = next * kBitsPerPacket + kBitsPerPacketHeader;
     }
     if (c.frames_left)
-        decode_frame(c, out_channels, rate);
+        decode_frame(c, out_channels);
 }
 
 // Writes the current frame's subframes (256-byte blocks) to the output, at
@@ -688,8 +819,7 @@ void clear(uint32_t id) {
     c.frames_left = 0;
     c.output_size = c.output_done = 0;
     c.pending_skip = 0;
-    c.channels = 0;
-    stop_voice(c.voice);
+    end_feed(c.voice);
     data.store(address);
 }
 
@@ -734,6 +864,7 @@ DWORD WINAPI decoder_thread(void*) {
         kicks += take_group(kKick, enable);
         for (uint32_t n = 0; n < kContexts; n++) {
             work(n);
+            feed_voice(state[n].voice);
             update_voice(state[n].voice);
         }
         LeaveCriticalSection(&lock);
@@ -747,9 +878,11 @@ DWORD WINAPI decoder_thread(void*) {
             for (const Context& c : state)
                 buffers += c.voice.buffer != nullptr;
             log("xma: %u kicks, %u locks, %u clears, %u worked, %u packets not in the banks, %u voices started, "
-                "%u voice matches, %u misses; %u voice buffers, %u sounds loaded (%u KB kept)\n",
+                "%u voice matches, %u misses; %u voice buffers, %u sounds loaded (%u KB kept); %u voices ran dry, "
+                "writes at least %d frames ahead\n",
                 kicks, locks, clears, worked, unknown_packets, voices_started, voice_matches, voice_misses, buffers,
-                unsigned(loaded.size()), kept_bytes >> 10);
+                unsigned(loaded.size()), kept_bytes >> 10, voices_dry, least_lead == ~0u ? -1 : int(least_lead));
+            least_lead = ~0u;
             logged_kicks = kicks;
         }
         Sleep(1);
@@ -946,7 +1079,7 @@ IMPORT(XMAReleaseContext) {
         // Its voice's buffer goes with it: the title creates far more
         // contexts over time than play at once.
         Voice& v = state[i].voice;
-        stop_voice(v);
+        end_feed(v);
         if (v.buffer)
             v.buffer->Release();
         v.buffer = nullptr;

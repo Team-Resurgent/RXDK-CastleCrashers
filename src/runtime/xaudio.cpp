@@ -14,6 +14,12 @@
 
 #include <climits>
 
+namespace xma {
+// A voice reading at input (a guest address in a context's output buffer)
+// plays at ratio x 48 kHz with gain (runtime/xma.cpp).
+void voice_params(uint32_t input, float ratio, float gain);
+}  // namespace xma
+
 extern "C" PPC_FUNC(__imp__sub_82121DE0);
 extern "C" PPC_FUNC(__imp__sub_8212EA98);
 extern "C" PPC_FUNC(__imp__sub_8212E2F0);
@@ -84,6 +90,9 @@ void resample(PPCContext& ctx, PPCBase base, Kernel& k) {
     uint32_t whole = uint32_t(end >> 32);
     uint32_t moved = whole * k.in_bytes / k.return_div;
     float frac = float(double(uint32_t(end)) * 2.3283064365386963e-10);
+    // The voice reading this input plays at step x 48 kHz on the APU: the
+    // rate XAudio takes it at, the title's pitch included.
+    xma::voice_params(ctx.r3.u32, float(step), 1.0f);
     if (k.checked < k.checks) {
         k.checked++;
         float before = load_float(frac_at);
