@@ -302,6 +302,7 @@ struct Feed {
     const BankEntry* entry = nullptr;  // null: none
     uint32_t key = 0;                  // the loaded sound's guest address (for its kept blocks)
     uint32_t stream = 0, next = 0, loop_start = 0, loop_end = 0, wraps = 0;
+    uint32_t loops = 255;  // passes of the loop left (255: for ever); the last plays on to the end
     uint32_t out_channels = 0, rate = 0;
     // Blocks read ahead from the bank: frames cache_first on.
     std::vector<uint8_t> cache;
@@ -321,6 +322,8 @@ struct Voice {
     // From XAudio, and what was last applied.
     volatile float ratio = 0, gain = 1;
     float applied_ratio = -1, applied_gain = -1;
+    // The pan (the front speakers' gains), and what was last applied.
+    float left = 1, right = 1, applied_left = -1, applied_right = -1;
 };
 
 struct Context {
@@ -394,7 +397,7 @@ void voice_write(Voice& v, const int16_t* samples, uint32_t channels, uint32_t r
         v.channels = channels;
         v.rate = rate;
         v.frame_bytes = frame_bytes;
-        v.applied_ratio = v.applied_gain = -1;
+        v.applied_ratio = v.applied_gain = v.applied_left = v.applied_right = -1;
     }
     uint32_t size = kVoiceFrames * frame_bytes;
     auto put = [&](uint32_t at, const void* data) {
@@ -485,6 +488,8 @@ void feed_frame(Voice& v) {
     if (++f.next >= f.loop_end && f.loop_end) {
         f.next = f.loop_start;
         f.wraps++;
+        if (f.loops != 255 && --f.loops == 0)
+            f.loop_end = 0;
         static int said;
         if (f.bank == &banks[1] && said++ < 30)
             log("xma: music loops back to frame %u\n", f.loop_start);
@@ -535,10 +540,24 @@ void update_voice(Voice& v) {
         v.buffer->SetFrequency(hz < 1000 ? 1000 : hz > 192000 ? 192000 : hz);
         v.applied_ratio = ratio;
     }
-    if (gain != v.applied_gain) {
+    // A gain in hundredths of a decibel.
+    auto millibels = [](float gain) {
         LONG mb = gain > 0.0001f ? LONG(2000.0f * std::log10(gain)) : DSBVOLUME_MIN;
-        v.buffer->SetVolume(mb < DSBVOLUME_MIN ? DSBVOLUME_MIN : mb > 0 ? 0 : mb);
+        return mb < DSBVOLUME_MIN ? DSBVOLUME_MIN : mb > 0 ? 0 : mb;
+    };
+    if (gain != v.applied_gain) {
+        v.buffer->SetVolume(millibels(gain));
         v.applied_gain = gain;
+    }
+    float left = v.left, right = v.right;
+    if (left != v.applied_left || right != v.applied_right) {
+        // A mono voice goes to both front speakers, a stereo one's channels
+        // one to each: the pan is their volumes.
+        DSMIXBINVOLUMEPAIR pairs[2] = {{DSMIXBIN_FRONT_LEFT, millibels(left)}, {DSMIXBIN_FRONT_RIGHT, millibels(right)}};
+        DSMIXBINS bins = {2, pairs};
+        v.buffer->SetMixBinVolumes(&bins);
+        v.applied_left = left;
+        v.applied_right = right;
     }
 }
 
@@ -557,6 +576,20 @@ Context state[kContexts];
 // Held by the decoder thread for a whole pass, and by XMACreateContext and
 // XMAReleaseContext: what Xenia's per-context locks are for.
 CRITICAL_SECTION lock;
+
+// An XAudio source voice (the overrides at the end): it plays the converted
+// sound its buffer holds on an APU voice of its own, at XAudio's volume, pan
+// and pitch. XAudio never starts it, so XAudio mixes nothing. One whose
+// buffer is not a converted sound is left to XAudio (native false).
+struct Source {
+    Voice voice;
+    bool native = false;   // its buffer is a converted sound
+    bool started = false;  // between Start and Stop
+    uint32_t first_frame = 0, context = 0;  // where its buffer starts; the buffer's pContext
+    float volume = 1, ratio = 1;
+};
+std::map<uint32_t, Source> sources;  // by the voice's guest address, under lock
+uint32_t native_buffers, xaudio_buffers;  // statistics
 
 // Statistics for the log: worked counts passes that decoded something.
 uint32_t kicks, locks, clears, worked, stray_kicks, unknown_packets;
@@ -883,21 +916,33 @@ DWORD WINAPI decoder_thread(void*) {
             feed_voice(state[n].voice);
             update_voice(state[n].voice);
         }
+        DWORD now = GetTickCount();
+        for (auto& [address, s] : sources) {
+            if (!s.native || !s.started)
+                continue;
+            s.voice.last_taken = now;  // no context to take its output: it ends with its sound
+            feed_voice(s.voice);
+            update_voice(s.voice);
+        }
         LeaveCriticalSection(&lock);
 
         if (stray_kicks != logged_stray) {
             log("xma: %u kicks of contexts not allocated\n", stray_kicks);
             logged_stray = stray_kicks;
         }
-        if ((logged_kicks == 0 && kicks) || (++passes % 10000 == 0 && kicks != logged_kicks)) {
+        static uint32_t logged_buffers;
+        if ((logged_kicks == 0 && kicks) || (logged_buffers == 0 && native_buffers) ||
+            (++passes % 10000 == 0 && (kicks != logged_kicks || native_buffers != logged_buffers))) {
+            logged_buffers = native_buffers;
             uint32_t buffers = 0;
             for (const Context& c : state)
                 buffers += c.voice.buffer != nullptr;
             log("xma: %u kicks, %u locks, %u clears, %u worked, %u packets not in the banks, %u voices started, "
                 "%u voice matches, %u misses; %u voice buffers, %u sounds loaded (%u KB kept); %u voices ran dry, "
-                "writes at least %d frames ahead\n",
+                "writes at least %d frames ahead; %u buffers on the APU, %u to XAudio, %u source voices\n",
                 kicks, locks, clears, worked, unknown_packets, voices_started, voice_matches, voice_misses, buffers,
-                unsigned(loaded.size()), kept_bytes >> 10, voices_dry, least_lead == ~0u ? -1 : int(least_lead));
+                unsigned(loaded.size()), kept_bytes >> 10, voices_dry, least_lead == ~0u ? -1 : int(least_lead),
+                native_buffers, xaudio_buffers, unsigned(sources.size()));
             least_lead = ~0u;
             logged_kicks = kicks;
         }
@@ -1143,4 +1188,261 @@ PPC_FUNC(sub_8210C690) {
         last -= stride;
     uint32_t header = packet_header(last);
     ctx.r3.u64 = ((last - start) << 3) + frame_bits(last, header, (header >> 26) - 1);
+}
+
+// --- XAudio's source voices on the APU ------------------------------------------
+//
+// The source voice's methods (its vtable is 82008D40): every sound the title
+// plays is a whole .xma file in one buffer (its audio manager, 820C0BB0 on),
+// so each voice plays its converted sound on an APU voice (Source) instead of
+// XAudio decoding and mixing it. The rest of its methods (details, effects,
+// filters, routing) stay XAudio's. The voice object: +64 its channels, +212
+// its sample rate.
+
+extern "C" PPC_FUNC(__imp__sub_8210D6D8);
+extern "C" PPC_FUNC(__imp__sub_82109DA0);
+extern "C" PPC_FUNC(__imp__sub_82109EF8);
+extern "C" PPC_FUNC(__imp__sub_8210C890);
+extern "C" PPC_FUNC(__imp__sub_8210C990);
+extern "C" PPC_FUNC(__imp__sub_821087F8);
+extern "C" PPC_FUNC(__imp__sub_8210F7A8);
+extern "C" PPC_FUNC(__imp__sub_82108A88);
+extern "C" PPC_FUNC(__imp__sub_82108B10);
+extern "C" PPC_FUNC(__imp__sub_821097B0);
+
+namespace {
+
+// The voice's Source when its buffer is a converted sound (lock held).
+Source* native_source(uint32_t voice) {
+    auto it = sources.find(voice);
+    return it != sources.end() && it->second.native ? &it->second : nullptr;
+}
+
+float float_at(uint32_t address) {
+    uint32_t bits = guest::load32(address);
+    float f;
+    __builtin_memcpy(&f, &bits, 4);
+    return f;
+}
+
+const char* sound_name(const Bank* bank, const BankEntry* entry) {
+    for (const auto& [name, i] : bank->by_name)
+        if (&bank->entries[i] == entry)
+            return name.c_str();
+    return "?";
+}
+
+}  // namespace
+
+// SubmitSourceBuffer(voice, XAUDIO2_BUFFER*: +8 the data, +20 loop begin and
+// +24 loop length in samples, +28 loop count (255 for ever), +32 context).
+PPC_FUNC(sub_8210D6D8) {
+    uint32_t voice = ctx.r3.u32, buffer = ctx.r4.u32;
+    uint32_t data = guest::load32(buffer + 8);
+    PacketRef p;
+    bool found = data && find_packet(data, p) && p.entry->channels;
+    EnterCriticalSection(&lock);
+    Source& s = sources[voice];
+    s.native = found;
+    if (found) {
+        Voice& v = s.voice;
+        end_feed(v);
+        Feed& f = v.feed;
+        f.bank = p.bank;
+        f.entry = p.entry;
+        f.key = p.key;
+        f.stream = p.stream;
+        f.next = p.first_frame;
+        f.wraps = 0;
+        f.out_channels = p.entry->channels < 2 ? 1 : 2;
+        uint32_t rate = guest::load32(voice + 212);
+        f.rate = rate >= 8000 && rate <= 96000 ? rate : 48000;
+        uint32_t loop_begin = guest::load32(buffer + 20), loop_length = guest::load32(buffer + 24);
+        uint32_t loop_count = guest::load32(buffer + 28);
+        f.loop_start = f.loop_end = 0;
+        f.loops = 255;
+        if (loop_count) {
+            f.loop_start = p.first_frame + loop_begin / kFrameSamples;
+            f.loop_end = loop_length ? p.first_frame + (loop_begin + loop_length + kFrameSamples - 1) / kFrameSamples
+                                     : p.entry->frames;
+            if (f.loop_end > p.entry->frames)
+                f.loop_end = p.entry->frames;
+            if (f.loop_end <= f.loop_start)
+                f.loop_end = 0;
+            f.loops = loop_count;
+        }
+        s.first_frame = p.first_frame;
+        s.context = guest::load32(buffer + 32);
+        v.ratio = float(f.rate) * s.ratio / 48000.0f;
+        v.gain = s.volume;
+        v.last_taken = GetTickCount();
+        native_buffers++;
+        static int said;  // a few: each line over the serial port stalls the title
+        if (said++ < 3)
+            log("xma: voice %08X plays %s at %u Hz, %u channels, frames %u of %u, loop %u-%u x%u\n", voice,
+                sound_name(p.bank, p.entry), f.rate, f.out_channels, f.next, p.entry->frames, f.loop_start, f.loop_end,
+                loop_count);
+    } else {
+        xaudio_buffers++;
+    }
+    LeaveCriticalSection(&lock);
+    if (found) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    static int said;
+    if (said++ < 10)
+        log("xma: voice %08X: buffer %08X (%u bytes) is not a converted sound: XAudio plays it\n", voice, data,
+            guest::load32(buffer + 4));
+    __imp__sub_8210D6D8(ctx, base);
+}
+
+// Start(voice, flags, operation set).
+PPC_FUNC(sub_82109DA0) {
+    EnterCriticalSection(&lock);
+    Source& s = sources[ctx.r3.u32];
+    s.started = true;
+    bool native = s.native;
+    if (native && s.voice.playing && s.voice.buffer)
+        s.voice.buffer->Play(0, 0, DSBPLAY_LOOPING);  // after a Stop: where it was
+    LeaveCriticalSection(&lock);
+    if (native) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82109DA0(ctx, base);
+}
+
+// Stop(voice, flags, operation set): paused where it is.
+PPC_FUNC(sub_82109EF8) {
+    EnterCriticalSection(&lock);
+    Source& s = sources[ctx.r3.u32];
+    s.started = false;
+    bool native = s.native;
+    if (native && s.voice.playing && s.voice.buffer)
+        s.voice.buffer->Stop();
+    LeaveCriticalSection(&lock);
+    if (native) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82109EF8(ctx, base);
+}
+
+// FlushSourceBuffers(voice): its buffer is done with.
+PPC_FUNC(sub_8210C890) {
+    EnterCriticalSection(&lock);
+    Source* s = native_source(ctx.r3.u32);
+    if (s)
+        end_feed(s->voice);
+    LeaveCriticalSection(&lock);
+    if (s) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_8210C890(ctx, base);
+}
+
+// GetState(voice, XAUDIO2_VOICE_STATE*: +0 the buffer's context, +4 buffers
+// queued, +8 samples played unless flags has 0x100). Its buffer is queued
+// until its sound has played out (or was flushed).
+PPC_FUNC(sub_8210C990) {
+    uint32_t state = ctx.r4.u32, flags = ctx.r5.u32;
+    EnterCriticalSection(&lock);
+    Source* s = native_source(ctx.r3.u32);
+    if (s) {
+        const Feed& f = s->voice.feed;
+        bool queued = f.entry != nullptr;
+        guest::store32(state, queued ? s->context : 0);
+        guest::store32(state + 4, queued ? 1 : 0);
+        if (!(flags & 0x100)) {
+            uint32_t frames = f.next >= s->first_frame ? f.next - s->first_frame : 0;
+            guest::store64(state + 8, uint64_t(frames + f.wraps * (f.loop_end - f.loop_start)) * kFrameSamples);
+        }
+    }
+    LeaveCriticalSection(&lock);
+    if (!s)
+        __imp__sub_8210C990(ctx, base);
+}
+
+// SetVolume(voice, f1 the gain, operation set).
+PPC_FUNC(sub_821087F8) {
+    EnterCriticalSection(&lock);
+    Source& s = sources[ctx.r3.u32];
+    s.volume = float(ctx.f1.f64);
+    s.voice.gain = s.volume;
+    bool native = s.native;
+    LeaveCriticalSection(&lock);
+    if (native) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_821087F8(ctx, base);
+}
+
+// SetOutputMatrix(voice, destination, r5 source by r6 destination channels,
+// r7 the gains, operation set): the pan. The title's audio manager sets a
+// mono sound's front left and right gains (0 and 1), a stereo one's left
+// gain at 0 and its right at 10.
+PPC_FUNC(sub_8210F7A8) {
+    uint32_t channels = ctx.r5.u32, outputs = ctx.r6.u32, matrix = ctx.r7.u32;
+    EnterCriticalSection(&lock);
+    Source* s = native_source(ctx.r3.u32);
+    if (s && matrix && outputs >= 2) {
+        uint32_t right = channels == 1 ? 1 : 10;
+        s->voice.left = float_at(matrix);
+        s->voice.right = right < channels * outputs ? float_at(matrix + right * 4) : s->voice.left;
+    }
+    LeaveCriticalSection(&lock);
+    if (s) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_8210F7A8(ctx, base);
+}
+
+// ExitLoop(voice, operation set): it plays on to the end.
+PPC_FUNC(sub_82108A88) {
+    EnterCriticalSection(&lock);
+    Source* s = native_source(ctx.r3.u32);
+    if (s)
+        s->voice.feed.loop_end = 0;
+    LeaveCriticalSection(&lock);
+    if (s) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82108A88(ctx, base);
+}
+
+// SetFrequencyRatio(voice, f1 the ratio, operation set).
+PPC_FUNC(sub_82108B10) {
+    EnterCriticalSection(&lock);
+    Source& s = sources[ctx.r3.u32];
+    float ratio = float(ctx.f1.f64);
+    s.ratio = ratio < 1.0f / 1024 ? 1.0f / 1024 : ratio > 8 ? 8 : ratio;
+    bool native = s.native;
+    if (native)
+        s.voice.ratio = float(s.voice.feed.rate) * s.ratio / 48000.0f;
+    LeaveCriticalSection(&lock);
+    if (native) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82108B10(ctx, base);
+}
+
+// DestroyVoice(voice): its APU voice goes with it.
+PPC_FUNC(sub_821097B0) {
+    EnterCriticalSection(&lock);
+    auto it = sources.find(ctx.r3.u32);
+    if (it != sources.end()) {
+        Voice& v = it->second.voice;
+        end_feed(v);
+        if (v.buffer)
+            v.buffer->Release();
+        sources.erase(it);
+    }
+    LeaveCriticalSection(&lock);
+    __imp__sub_821097B0(ctx, base);
 }
