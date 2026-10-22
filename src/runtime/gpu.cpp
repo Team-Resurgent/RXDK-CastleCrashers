@@ -54,6 +54,11 @@ volatile bool started;
 uint32_t opcode_counts[128], draws, indices, shader_loads, constants_set;
 // Cycles (rdtsc) since the last statistics line.
 uint64_t shade_cycles, submit_cycles, busy_cycles, last_tsc, opcode_cycles[128];
+// Statistics: draws, vertices and shading cycles by vertex shader.
+struct ShaderUse {
+    uint32_t hash, draws, vertices;
+    uint64_t cycles;
+} shader_uses[8];
 // WAIT_REG_MEM polls that had to sleep (statistics).
 uint32_t waits;
 
@@ -280,6 +285,15 @@ void draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
         for (uint32_t i = 0; i < count; i++)
             gpu::shade_vertex(state, vs_code.data(), uint32_t(vs_code.size()), index_list[i], shaded[i]);
     uint64_t t1 = __builtin_ia32_rdtsc();
+    for (ShaderUse& u : shader_uses) {
+        if (u.hash == active_vs || !u.hash) {
+            u.hash = active_vs;
+            u.draws++;
+            u.vertices += count;
+            u.cycles += t1 - t0;
+            break;
+        }
+    }
     gpu::renderer::draw(state, primitive, shaded.data(), count, active_ps);
     shade_cycles += t1 - t0;
     submit_cycles += __builtin_ia32_rdtsc() - t1;
@@ -618,6 +632,16 @@ DWORD WINAPI gpu_thread(void*) {
             memset(opcode_cycles, 0, sizeof(opcode_cycles));
             memset(opcode_counts, 0, sizeof(opcode_counts));
             shade_cycles = submit_cycles = busy_cycles = 0;
+            char line[384];
+            int n = snprintf(line, sizeof(line), "gpu: by vertex shader (draws, vertices, ms):");
+            for (ShaderUse& u : shader_uses) {
+                if (u.hash)
+                    n += snprintf(line + n, sizeof(line) - n, " %08X %u %u %u", u.hash, u.draws, u.vertices,
+                                  unsigned(u.cycles / 733000));
+                u.draws = u.vertices = 0;
+                u.cycles = 0;
+            }
+            log("%s\n", line);
             draws = indices = constants_set = 0;
             last_frames = frames;
             last_log = now;

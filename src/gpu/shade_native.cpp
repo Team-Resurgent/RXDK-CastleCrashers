@@ -8,6 +8,7 @@
 // SHADE_NATIVE_VERIFY runs the interpreter as well and logs differences.
 #include "gpu/renderer.h"
 
+
 #include <cmath>
 #include <cstring>
 
@@ -176,6 +177,41 @@ void vs_transform(const GpuState& gpu, const uint32_t* indices, uint32_t count, 
     }
 }
 
+// CAD56521 and 54003070: oPos = (x, y, z, 1) . c0..c3 (the mul and three mads
+// in their order: c3, c2, c1, c0), then kTexcoords texcoords (o0.xy, o1.xy)
+// and the colour (r0.zyxw of the 8888) after them; fetch constant 95,
+// kStride dwords a vertex.
+template <uint32_t kStride, int kTexcoords>
+void vs_transform3(const GpuState& gpu, const uint32_t* indices, uint32_t count, ShadedVertex* out) {
+    Stream s(gpu, 95);
+    Vec c[4];
+    for (int k = 0; k < 4; k++)
+        c[k] = constant(gpu, k);
+    auto at = [](const Vec& v, int k) { return k == 0 ? v.x : k == 1 ? v.y : k == 2 ? v.z : v.w; };
+    for (uint32_t i = 0; i < count; i++) {
+        ShadedVertex& v = out[i];
+        clear(v);
+        uint32_t b = s.base(float(indices[i]), kStride);
+        float x = s.f(b), y = s.f(b + 1), z = s.f(b + 2);
+        for (int k = 0; k < 4; k++) {
+            float t = mul(1.0f, at(c[3], k));
+            t = mul(z, at(c[2], k)) + t;
+            t = mul(y, at(c[1], k)) + t;
+            v.position[k] = mul(x, at(c[0], k)) + t;
+        }
+        for (int n = 0; n < kTexcoords; n++) {
+            v.interpolators[n][0] = s.f(b + 3 + 2 * n);
+            v.interpolators[n][1] = s.f(b + 4 + 2 * n);
+        }
+        float rgba[4];
+        s.unorm8888(b + 3 + 2 * kTexcoords, rgba);
+        v.interpolators[kTexcoords][0] = rgba[2];
+        v.interpolators[kTexcoords][1] = rgba[1];
+        v.interpolators[kTexcoords][2] = rgba[0];
+        v.interpolators[kTexcoords][3] = rgba[3];
+    }
+}
+
 // 357ECB8C and C2305F3B: sprites, one 12-dword record (fetch constant 95)
 // for every 4 vertices, the vertex choosing the corner. They differ in the
 // c254 components the corner offsets and scale come from, and in o1.
@@ -305,6 +341,12 @@ NativeShader native_for(uint32_t hash) {
     case 0x71DEEEFD: return vs_transform;
     case 0x357ECB8C: return vs_sprite<false>;
     case 0xC2305F3B: return vs_sprite<true>;
+    // Castle Crashers': the same as Jetpac's position2 and position_color,
+    // and the transforms above.
+    case 0xDAEB7241: return vs_position2;
+    case 0xF336FFD4: return vs_position_color;
+    case 0xCAD56521: return vs_transform3<6, 1>;
+    case 0x54003070: return vs_transform3<8, 2>;
     default: return nullptr;
     }
 }

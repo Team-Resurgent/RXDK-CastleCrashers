@@ -564,6 +564,10 @@ uint32_t checked_job;   // the job rasterized both ways
 std::vector<uint8_t> checked_copy;
 uint32_t deferred, on_demand, defer_checks, defer_mismatches, on_demand_timeouts, on_demand_stale;  // statistics
 uint64_t on_demand_cycles;
+// The worker: it runs below the title's threads, so a loading screen keeps
+// its frame rate while it rasterizes, and above everything while the
+// renderer waits for it (raster_on_demand).
+GuestThread* worker;
 
 struct PendingInit {
     PendingInit() {
@@ -691,8 +695,12 @@ bool raster_on_demand(uint32_t texture) {
     if (!kept)
         return false;
     uint64_t t0 = __builtin_ia32_rdtsc();
+    if (worker)
+        SetThreadPriority(worker->handle, THREAD_PRIORITY_HIGHEST);
     SetEvent(request_event);
     bool done = WaitForSingleObject(done_event, 3000) == WAIT_OBJECT_0;
+    if (worker)
+        SetThreadPriority(worker->handle, THREAD_PRIORITY_BELOW_NORMAL);
     EnterCriticalSection(&pending_lock);
     done = done && request_done;
     if (requested == texture) {  // timed out: the worker did not get to it
@@ -710,6 +718,8 @@ bool raster_on_demand(uint32_t texture) {
 // job + 572): one of a deferred pack's is kept, not rasterized (the
 // worker's loop goes on: cc_raster_done sees it).
 PPC_FUNC(sub_820D6258) {
+    if (!worker && (worker = current_thread()))
+        SetThreadPriority(worker->handle, THREAD_PRIORITY_BELOW_NORMAL);
     uint32_t job = ctx.r3.u32 - 4;
     uint32_t width = guest::load32(job + 552), height = guest::load32(job + 556);
     if (kDeferRaster && power_of_two_size(width, height) && deferred_pack()) {
