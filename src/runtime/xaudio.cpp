@@ -122,6 +122,41 @@ PPC_FUNC(sub_8212EA98) { resample(ctx, base, stereo); }
 PPC_FUNC(sub_8212E2F0) { resample(ctx, base, mono); }
 PPC_FUNC(sub_8212C658) { resample(ctx, base, downmix); }
 
+// XAudio's mixing kernels: a job (+0 the source, +4 the destination, +8 the
+// volume matrix of +24 input by +28 output channels, +12 its ramp, +20 the
+// floats) mixed into the destination. Not heard (the voices play on the
+// APU): they do nothing, as XAudio's resamplers only advance.
+namespace {
+uint32_t mixes;  // statistics
+}  // namespace
+
+#define MIXER(name) \
+    PPC_FUNC(name) { mixes++; }
+MIXER(sub_821267F8)
+MIXER(sub_821269B0)
+MIXER(sub_82126AB8)
+MIXER(sub_82126C90)
+MIXER(sub_82126F78)
+MIXER(sub_821271B8)
+MIXER(sub_82127780)
+MIXER(sub_82127CE0)
+MIXER(sub_82127EC8)
+MIXER(sub_821282D8)
+MIXER(sub_821286D0)
+MIXER(sub_82128A98)
+MIXER(sub_82128CB0)
+MIXER(sub_82128DF0)
+MIXER(sub_82129020)
+MIXER(sub_821293C0)
+MIXER(sub_82129758)
+MIXER(sub_82129E90)
+MIXER(sub_8212A590)
+MIXER(sub_8212A9D8)
+MIXER(sub_821309B8)
+
 namespace xaudio {
-void log_profile(uint32_t seconds) { (void)seconds; }
+void log_profile(uint32_t seconds) {
+    log("xaudio: %u mixes a second skipped\n", mixes / seconds);
+    mixes = 0;
+}
 }  // namespace xaudio
