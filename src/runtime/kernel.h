@@ -55,8 +55,10 @@ namespace kernel {
 // host_priority).
 constexpr int kRuntimePriority = THREAD_PRIORITY_HIGHEST;
 // The host stack of a thread running guest code: the recompiled functions'
-// frames, as deep as the guest's calls. Xbox stacks are committed memory.
-constexpr uint32_t kGuestHostStack = 0x40000;
+// frames, as deep as the guest's calls. Xbox stacks are committed memory:
+// Castle Crashers' threads were seen using at most 6 KB (the watchdog logs
+// it), so 64 KB.
+constexpr uint32_t kGuestHostStack = 0x10000;
 // A runtime thread at kRuntimePriority (fatal if it cannot start).
 HANDLE start_runtime_thread(LPTHREAD_START_ROUTINE routine, void* parameter, uint32_t stack_size);
 // Cycles (rdtsc) the CPU has had nothing else to run, so far.
@@ -74,6 +76,9 @@ struct ImportScope {
             thread->import = name;
             thread->import_caller = caller;
             thread->in_import = true;
+            uintptr_t sp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+            if (sp < thread->host_stack_low)
+                thread->host_stack_low = sp;
         }
         if (trace_imports)
             trace_import(name, caller);

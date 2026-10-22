@@ -8,16 +8,27 @@
 // kernel only remembers (the title queries nothing in them).
 #include "kernel.h"
 
+#include <map>
 #include <set>
 #include <string>
 
 namespace {
 
 std::set<HANDLE> directories;
+std::map<HANDLE, std::string> file_paths;  // for the log (a reused handle gets its new path)
+std::map<HANDLE, HANDLE> listings;          // a directory's kernel handle, for NtQueryDirectoryFile
 CRITICAL_SECTION directories_lock;
 struct Init {
     Init() { InitializeCriticalSection(&directories_lock); }
 } init_lock;
+
+std::string path_of(HANDLE h) {
+    EnterCriticalSection(&directories_lock);
+    auto it = file_paths.find(h);
+    std::string path = it == file_paths.end() ? "?" : it->second;
+    LeaveCriticalSection(&directories_lock);
+    return path;
+}
 
 bool starts_with(const std::string& s, const char* prefix) {
     size_t n = strlen(prefix);
@@ -83,8 +94,25 @@ void open(PPCContext& ctx, uint32_t disposition, uint32_t options) {
             return;
         }
         HANDLE h = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        // The kernel's own handle on the directory, for listing it.
+        std::string kernel_path = "\\??\\" + path;
+        ANSI_STRING name;
+        RtlInitAnsiString(&name, kernel_path.c_str());
+        OBJECT_ATTRIBUTES attributes_of;
+        InitializeObjectAttributes(&attributes_of, &name, OBJ_CASE_INSENSITIVE, nullptr);
+        IO_STATUS_BLOCK status;
+        HANDLE listing = nullptr;
+        if (!NT_SUCCESS(NtOpenFile(&listing, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attributes_of, &status,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)))
+            listing = nullptr;
         EnterCriticalSection(&directories_lock);
         directories.insert(h);
+        file_paths[h] = path;
+        HANDLE& slot = listings[h];
+        if (slot)
+            NtClose(slot);  // a closed directory's, its handle come back
+        slot = listing;
         LeaveCriticalSection(&directories_lock);
         guest::store32(ctx.r3.u32, kernel::add_handle(h));
         io_status(ctx.r6.u32, kSuccess, 1);
@@ -103,7 +131,24 @@ void open(PPCContext& ctx, uint32_t disposition, uint32_t options) {
         ctx.r3.u64 = status;
         return;
     }
-    log("io: open %s\n", path.c_str());
+    // Each file once (the title opens its sound pack for every sound).
+    static std::set<std::string> opened;
+    EnterCriticalSection(&directories_lock);
+    bool first = opened.insert(path).second;
+    file_paths[h] = path;
+    // A closed directory's handle comes back for a file: it is not a
+    // directory any more (the title lists a folder, closes it and opens a
+    // file in it, which then was taken for an empty directory).
+    directories.erase(h);
+    auto listing = listings.find(h);
+    if (listing != listings.end()) {
+        if (listing->second)
+            NtClose(listing->second);
+        listings.erase(listing);
+    }
+    LeaveCriticalSection(&directories_lock);
+    if (first || kernel::trace_imports)
+        log("io: open %s (%lu bytes)\n", path.c_str(), GetFileSize(h, nullptr));
     guest::store32(ctx.r3.u32, kernel::add_handle(h));
     io_status(ctx.r6.u32, kSuccess, exists ? 1 : 2);  // FILE_OPENED / FILE_CREATED
     ctx.r3.u64 = kSuccess;
@@ -132,6 +177,50 @@ IMPORT(NtOpenFile) {
     open(ctx, 1, ctx.r8.u32);
 }
 
+// Scatter/gather I/O: the buffer is a list of pages, each a 64-bit
+// FILE_SEGMENT_ELEMENT holding the page's address. Castle Crashers reads its
+// packs this way.
+static uint32_t scatter_gather(HANDLE h, uint32_t segments, uint32_t length, uint32_t offset_pointer, bool write) {
+    if (!seek(h, offset_pointer))
+        return ~0u;
+    uint32_t done = 0;
+    for (uint32_t i = 0; done < length; i++) {
+        uint32_t page = uint32_t(guest::load64(segments + i * 8));
+        uint32_t chunk = length - done < guest::kPage ? length - done : guest::kPage;
+        guest::touch(page, chunk);
+        DWORD moved = 0;
+        BOOL ok = write ? WriteFile(h, guest::host(page), chunk, &moved, nullptr)
+                        : ReadFile(h, guest::host(page), chunk, &moved, nullptr);
+        if (!ok)
+            return done ? done : ~0u;
+        done += moved;
+        if (moved < chunk)
+            break;  // the end of the file
+    }
+    return done;
+}
+
+IMPORT(NtReadFileScatter) {
+    // (handle, event, apc routine, apc context, io status*, segments, length, offset*)
+    HANDLE h = kernel::host_handle(ctx.r3.u32);
+    uint32_t read = scatter_gather(h, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, false);
+    uint32_t status = read == ~0u ? kUnsuccessful : read == 0 && ctx.r9.u32 ? kEndOfFile : kSuccess;
+    io_status(ctx.r7.u32, status, read == ~0u ? 0 : read);
+    if (ctx.r4.u32)
+        SetEvent(kernel::host_handle(ctx.r4.u32));
+    ctx.r3.u64 = status;
+}
+
+IMPORT(NtWriteFileGather) {
+    HANDLE h = kernel::host_handle(ctx.r3.u32);
+    uint32_t written = scatter_gather(h, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, true);
+    uint32_t status = written == ~0u ? kUnsuccessful : kSuccess;
+    io_status(ctx.r7.u32, status, written == ~0u ? 0 : written);
+    if (ctx.r4.u32)
+        SetEvent(kernel::host_handle(ctx.r4.u32));
+    ctx.r3.u64 = status;
+}
+
 IMPORT(NtReadFile) {
     // (handle, event, apc routine, apc context, io status*, buffer, length, offset*)
     HANDLE h = kernel::host_handle(ctx.r3.u32);
@@ -139,11 +228,29 @@ IMPORT(NtReadFile) {
     DWORD read = 0;
     guest::touch(ctx.r8.u32, ctx.r9.u32);  // the file system fills it: no faults
     if (!seek(h, ctx.r10.u32) || !ReadFile(h, guest::host(ctx.r8.u32), ctx.r9.u32, &read, nullptr)) {
+        static int said;
+        if (said++ < 20)
+            log("io: read of %u bytes at %08X%s failed (%lu)\n", ctx.r9.u32, ctx.r8.u32,
+                ctx.r10.u32 ? "" : " (no offset)", GetLastError());
         io_status(status_block, kUnsuccessful, 0);
         ctx.r3.u64 = kUnsuccessful;
         return;
     }
+    if (read < ctx.r9.u32) {
+        static int said;
+        if (said++ < 20)
+            log("io: read %u of %u bytes at offset %llu of %s\n", unsigned(read), ctx.r9.u32,
+                ctx.r10.u32 ? (unsigned long long)guest::load64(ctx.r10.u32) : 0ull, path_of(h).c_str());
+    }
     uint32_t status = read == 0 && ctx.r9.u32 ? kEndOfFile : kSuccess;
+    // A sound's XMA data (the headers come in small reads before it): only
+    // the XMA decoder reads it, and it plays silence until sound is done,
+    // so its memory goes back. 64 MB does not hold every sound effect too.
+    if (read >= 2 * guest::kPage) {
+        std::string path = path_of(h);
+        if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".xma") == 0)
+            guest::release(ctx.r8.u32, read);
+    }
     io_status(status_block, status, read);
     if (ctx.r4.u32)
         SetEvent(kernel::host_handle(ctx.r4.u32));
@@ -169,6 +276,92 @@ IMPORT(NtFlushBuffersFile) {
     FlushFileBuffers(kernel::host_handle(ctx.r3.u32));
     io_status(ctx.r4.u32, kSuccess, 0);
     ctx.r3.u64 = kSuccess;
+}
+
+IMPORT(NtQueryFullAttributesFile) {
+    // (attributes*, FILE_NETWORK_OPEN_INFORMATION*: four times, allocation
+    // size, end of file, attributes)
+    std::string path = host_path(ctx.r3.u32);
+    DWORD attributes = GetFileAttributesA(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        ctx.r3.u64 = kObjectNameNotFound;
+        return;
+    }
+    uint64_t size = 0;
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD high = 0, low = GetFileSize(f, &high);
+            size = (uint64_t(high) << 32) | low;
+            CloseHandle(f);
+        }
+    }
+    uint32_t info = ctx.r4.u32;
+    for (uint32_t i = 0; i < 4; i++)
+        guest::store64(info + i * 8, 0);
+    guest::store64(info + 32, (size + 4095) & ~uint64_t(4095));
+    guest::store64(info + 40, size);
+    guest::store32(info + 48, (attributes & FILE_ATTRIBUTE_DIRECTORY) ? 0x10 : 0x80);  // directory / normal
+    ctx.r3.u64 = kSuccess;
+}
+
+IMPORT(NtQueryDirectoryFile) {
+    // (handle, event, apc routine, apc context, io status*, information,
+    // length, mask*, restart: the 360's has no information class, it is
+    // always FileDirectoryInformation): through the kernel's own handle on the
+    // directory (libxapi's FindFirstFileA faults). FILE_DIRECTORY_INFORMATION
+    // is laid out as the 360's (ANSI names), in the host's byte order.
+    HANDLE h = kernel::host_handle(ctx.r3.u32);
+    EnterCriticalSection(&directories_lock);
+    auto it = listings.find(h);
+    HANDLE listing = it == listings.end() ? nullptr : it->second;
+    LeaveCriticalSection(&directories_lock);
+    uint32_t status = kNoMoreFiles, written = 0;
+    if (listing) {
+        uint32_t mask = ctx.r10.u32;
+        std::string pattern;
+        ANSI_STRING name;
+        if (mask)
+            pattern.assign(reinterpret_cast<const char*>(guest::host(guest::load32(mask + 4))), guest::load16(mask));
+        RtlInitAnsiString(&name, pattern.c_str());
+        alignas(8) uint8_t entries[4096];
+        IO_STATUS_BLOCK io;
+        status = uint32_t(NtQueryDirectoryFile(listing, nullptr, nullptr, nullptr, &io, entries, sizeof(entries),
+                                               FileDirectoryInformation, mask ? &name : nullptr,
+                                               BOOLEAN(kernel::arg(ctx, 8) & 0xFF)));
+        // Each entry the guest's buffer holds: 64 bytes, then the name; the
+        // next at an eight-byte boundary.
+        uint32_t out = ctx.r8.u32, room = ctx.r9.u32, previous = 0;
+        for (uint32_t at = 0; NT_SUCCESS(status);) {
+            auto* e = reinterpret_cast<FILE_DIRECTORY_INFORMATION*>(entries + at);
+            uint32_t size = 64 + e->FileNameLength;
+            if (written + size > room)
+                break;
+            uint32_t to = out + written;
+            if (written)
+                guest::store32(out + previous, written - previous);  // the previous entry's NextEntryOffset
+            guest::store32(to, 0);
+            guest::store32(to + 4, e->FileIndex);
+            const LARGE_INTEGER* times[6] = {&e->CreationTime, &e->LastAccessTime, &e->LastWriteTime,
+                                             &e->ChangeTime, &e->EndOfFile, &e->AllocationSize};
+            for (int i = 0; i < 6; i++)
+                guest::store64(to + 8 + i * 8, uint64_t(times[i]->QuadPart));
+            guest::store32(to + 56, e->FileAttributes);
+            guest::store32(to + 60, e->FileNameLength);
+            memcpy(guest::host(to + 64), e->FileName, e->FileNameLength);
+            previous = written;
+            written += (size + 7) & ~7u;
+            if (!e->NextEntryOffset)
+                break;
+            at += e->NextEntryOffset;
+        }
+        if (NT_SUCCESS(status) && !written)
+            status = 0x80000005;  // STATUS_BUFFER_OVERFLOW
+    }
+    io_status(ctx.r7.u32, status, written);
+    if (ctx.r4.u32)
+        SetEvent(kernel::host_handle(ctx.r4.u32));
+    ctx.r3.u64 = status;
 }
 
 IMPORT(NtQueryInformationFile) {
@@ -220,6 +413,8 @@ IMPORT(NtSetInformationFile) {
         uint64_t position = guest::load64(ctx.r5.u32);
         LONG high = LONG(position >> 32);
         SetFilePointer(h, LONG(position), &high, FILE_BEGIN);
+        if (kernel::trace_imports)
+            log("io: seek %s to %llu\n", path_of(h).c_str(), (unsigned long long)position);
         break;
     }
     case 20: {  // FileEndOfFileInformation

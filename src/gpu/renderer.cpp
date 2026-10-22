@@ -125,9 +125,95 @@ struct Texture {
 // released, so a texture costs a quarter of its size whether or not it is
 // ever drawn. The renderer takes one when a fetch matches it.
 struct Prepared {
-    std::vector<uint8_t> dxt5;  // emptied when the renderer has taken it
+    // Its DXT5 blocks, row by row, LZ-compressed (lz_compress): most
+    // prepared textures wait long (the title draws every animation frame of
+    // a pack at once), and a sprite's blocks repeat (its transparent
+    // surroundings, its outlines and fills). Emptied when the renderer has
+    // taken it.
+    std::vector<uint8_t> dxt5;
     uint32_t width, height, sequence;
 };
+// Statistics: DXT5 bytes prepared, and as compressed.
+uint64_t prepared_raw_bytes, prepared_packed_bytes;
+
+// LZ4's block format: a token (literal length << 4 | match length - 4), its
+// length bytes past 15, the literals, a 16-bit little-endian distance
+// back, the match length bytes past 15. The last sequence has no match.
+void lz_put_length(std::vector<uint8_t>& out, uint32_t n) {
+    for (; n >= 255; n -= 255)
+        out.push_back(255);
+    out.push_back(uint8_t(n));
+}
+
+std::vector<uint8_t> lz_compress(const uint8_t* in, uint32_t size) {
+    std::vector<uint8_t> out;
+    out.reserve(size / 2);
+    std::vector<uint32_t> table(4096);  // a hash of 4 bytes -> their last position + 1
+    uint32_t literal = 0, at = 0;
+    auto emit = [&](uint32_t end_literals, uint32_t distance, uint32_t length) {
+        uint32_t lit = end_literals - literal;
+        size_t token = out.size();
+        out.push_back(uint8_t((lit < 15 ? lit : 15) << 4));
+        if (lit >= 15)
+            lz_put_length(out, lit - 15);
+        out.insert(out.end(), in + literal, in + end_literals);
+        if (!length)
+            return;
+        out.push_back(uint8_t(distance));
+        out.push_back(uint8_t(distance >> 8));
+        uint32_t m = length - 4;
+        out[token] |= uint8_t(m < 15 ? m : 15);
+        if (m >= 15)
+            lz_put_length(out, m - 15);
+    };
+    while (at + 12 <= size) {  // LZ4 leaves the last 12 bytes literal
+        uint32_t v;
+        memcpy(&v, in + at, 4);
+        uint32_t h = (v * 2654435761u) >> 20;
+        uint32_t candidate = table[h];
+        table[h] = at + 1;
+        if (candidate && at - (candidate - 1) <= 65535 && memcmp(in + candidate - 1, in + at, 4) == 0) {
+            uint32_t from = candidate - 1, length = 4;
+            while (at + length + 5 < size && in[from + length] == in[at + length])
+                length++;
+            emit(at, at - from, length);
+            at += length;
+            literal = at;
+        } else {
+            at++;
+        }
+    }
+    emit(size, 0, 0);
+    return out;
+}
+
+void lz_decompress(const uint8_t* in, size_t size, uint8_t* out, size_t out_size) {
+    size_t i = 0, o = 0;
+    while (i < size) {
+        uint8_t token = in[i++];
+        size_t lit = token >> 4;
+        if (lit == 15)
+            for (uint8_t b = 255; b == 255 && i < size; lit += b)
+                b = in[i++];
+        if (o + lit > out_size || i + lit > size)
+            return;
+        memcpy(out + o, in + i, lit);
+        i += lit;
+        o += lit;
+        if (i >= size)
+            return;
+        size_t distance = in[i] | (in[i + 1] << 8);
+        i += 2;
+        size_t length = (token & 15) + 4;
+        if ((token & 15) == 15)
+            for (uint8_t b = 255; b == 255 && i < size; length += b)
+                b = in[i++];
+        if (!distance || distance > o || o + length > out_size)
+            return;
+        for (size_t k = 0; k < length; k++, o++)  // may overlap: byte by byte
+            out[o] = out[o - distance];
+    }
+}
 std::map<uint32_t, Prepared> prepared;
 uint32_t prepared_sequence;
 CRITICAL_SECTION prepared_lock;
@@ -596,10 +682,11 @@ const Texture* prepared_texture(const TextureKey& key, uint32_t guest, uint32_t 
     }
     D3DLOCKED_RECT locked;
     if (SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0))) {
+        std::vector<uint8_t> blocks(size_t(width) * height);  // 16 bytes a 4x4 block
+        lz_decompress(p->second.dxt5.data(), p->second.dxt5.size(), blocks.data(), blocks.size());
         uint32_t row = width / 4 * 16;
         for (uint32_t y = 0; y < height / 4; y++)
-            memcpy(static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch, &p->second.dxt5[size_t(y) * row],
-                   row);
+            memcpy(static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch, &blocks[size_t(y) * row], row);
         texture->UnlockRect(0);
     }
     if (it != textures.end()) {
@@ -1571,18 +1658,24 @@ void request_debug_frame() { debug_requested = true; }
 void prepare_texture(uint32_t guest, uint32_t width, uint32_t height) {
     if (width < 4 || height < 4 || (width & (width - 1)) || (height & (height - 1)))
         return;
-    std::vector<uint8_t> dxt5(size_t(width) * height);  // 16 bytes a 4x4 block
+    // The blocks in row order, then compressed (Prepared).
+    std::vector<uint8_t> blocks(size_t(width) * height);  // 16 bytes a 4x4 block
     uint32_t block[16];
     for (uint32_t by = 0; by < height / 4; by++) {
         for (uint32_t bx = 0; bx < width / 4; bx++) {
             for (uint32_t y = 0; y < 4; y++)
                 for (uint32_t x = 0; x < 4; x++)
                     block[y * 4 + x] = guest::load32(guest + ((by * 4 + y) * width + bx * 4 + x) * 4);
-            encode_dxt5_block(block, &dxt5[(size_t(by) * (width / 4) + bx) * 16]);
+            encode_dxt5_block(block, &blocks[(size_t(by) * (width / 4) + bx) * 16]);
         }
     }
     guest::release(guest, width * height * 4);
+    std::vector<uint8_t> dxt5 = lz_compress(blocks.data(), uint32_t(blocks.size()));
+    dxt5.shrink_to_fit();
+    std::vector<uint8_t>().swap(blocks);
     PreparedLock held;
+    prepared_raw_bytes += uint64_t(width) * height;
+    prepared_packed_bytes += dxt5.size();
     Prepared& p = prepared[guest];
     p.dxt5.swap(dxt5);
     p.width = width;
@@ -1641,7 +1734,23 @@ void present() {
                     t.stable, presented - t.used);
             }
         }
-        log("renderer: %u textures, %u released (%u KB)\n", unsigned(textures.size()), kept, kept_bytes >> 10);
+        uint32_t d3d_bytes = 0, waiting = 0, waiting_bytes = 0;
+        for (auto& [key, t] : textures) {
+            D3DSURFACE_DESC desc;
+            if (t.texture && SUCCEEDED(t.texture->GetLevelDesc(0, &desc)))
+                d3d_bytes += desc.Size;
+        }
+        {
+            PreparedLock held;
+            for (auto& [address, p] : prepared) {
+                waiting += !p.dxt5.empty();
+                waiting_bytes += uint32_t(p.dxt5.size());
+            }
+        }
+        log("renderer: %u textures (%u KB), %u released (%u KB of guest memory); %u prepared waiting (%u KB); "
+            "prepared so far %u KB as %u KB\n",
+            unsigned(textures.size()), d3d_bytes >> 10, kept, kept_bytes >> 10, waiting, waiting_bytes >> 10,
+            unsigned(prepared_raw_bytes >> 10), unsigned(prepared_packed_bytes >> 10));
     }
     if (presented % 1800 == 1) {
         // The caches' textures and their memory (level 0, power-of-two).

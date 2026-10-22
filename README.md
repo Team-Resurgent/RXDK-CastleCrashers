@@ -20,19 +20,28 @@ Early work in progress. **Nothing is playable yet.**
 - Title update 2 is applied to `default.xex` and the whole title
   recompiles (7,170 functions).
 - In xemu it runs its logos, legal screen, attract sequence and title menu,
-  drawn on the NV2A, at about 30 frames a second. Nothing has been played
-  yet (no input tested), and sound is not working.
+  drawn on the NV2A, at about 30 frames a second, and with a scripted
+  controller (`build/inputs.txt`) goes from the menu through the gameplay
+  loading (every pack and sound) into the character select. Sound is
+  silent.
+- The title draws its vector art into textures on the processor at load
+  time, and on the Pentium III that is slow: the gameplay loading takes
+  minutes.
 - Memory, aiming at a retail 64 MB console:
   - Guest memory is committed when it is touched: the title commits a 32 MB
     heap, a 6 MB arena per 360 hardware thread and a 16 MB GPU block, and
-    touches a fraction of them (`src/runtime/memory.cpp`).
+    touches a fraction of them (`src/runtime/memory.cpp`). The guest window
+    is 512 MB of address space for what it commits.
   - One job worker instead of five: the workers rasterize the title's
     vector art into textures, each with its own arena.
   - Each rasterized texture is compressed to DXT5 as the worker finishes it
-    and its guest memory given back (`gpu::renderer::prepare_texture`):
-    the menu's textures cost a quarter of their size, once.
-  - At 64 MB (xemu, iND-BiOS) the title reaches its menu and stays there
-    with about 6 MB free; gameplay is not tested yet.
+    and its guest memory given back (`gpu::renderer::prepare_texture`);
+    until it is first drawn it is kept LZ-compressed (about 6:1 over DXT5,
+    for the thousands of animation frames a pack draws at once).
+  - The sound effects' XMA data is given back as it is read (sound is
+    silent), host stacks are 64 KB, and the game code is built with -Os.
+  - At 64 MB (xemu, iND-BiOS) the title runs through the character select
+    loading with about 10 MB free.
 
 ## Building
 

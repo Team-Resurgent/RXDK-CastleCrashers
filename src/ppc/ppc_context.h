@@ -35,7 +35,9 @@ struct PPCBase
     uint8_t* window;  // the host address of guest PPC_WINDOW_BASE
 
     static constexpr uint32_t PPC_WINDOW_BASE = 0x7F000000;
-    static constexpr uint32_t PPC_WINDOW_MASK = 0x0FFFFFFF;  // 256 MB
+    // 512 MB: a power of two, so the 360's physical aliases (0xA0000000,
+    // 0xC0000000, 0xE0000000 + address) fold onto 0x80000000 + address.
+    static constexpr uint32_t PPC_WINDOW_MASK = 0x1FFFFFFF;
 
     uint8_t* operator+(uint32_t address) const
     {

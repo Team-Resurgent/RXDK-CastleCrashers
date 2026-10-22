@@ -673,7 +673,7 @@ IMPORT(VdSetGraphicsInterruptCallback) {
     static bool vblank;
     if (!vblank) {
         vblank = true;
-        kernel::start_runtime_thread(vblank_thread, nullptr, 0x40000);
+        kernel::start_runtime_thread(vblank_thread, nullptr, 0x8000);
     }
 }
 

@@ -8,7 +8,9 @@
 // DISPATCHER_HEADER standing for them.
 #include "kernel.h"
 
+#include <algorithm>
 #include <map>
+#include <vector>
 
 #ifndef MAXIMUM_WAIT_OBJECTS
 #define MAXIMUM_WAIT_OBJECTS 64
@@ -112,18 +114,25 @@ DWORD WINAPI watchdog_thread(void*) {
         static unsigned rounds;
         if (rounds % 6 == 5)  // every 30 s: where the memory is
             guest::log_blocks(14);
-        if (++rounds == 5 || rounds == 9) {
-            // 25 and 45 s in: what each thread has been calling (a title
-            // spinning on something that never comes).
-            for (GuestThread* t = all_threads; t; t = t->next)
-                dump_calls(t, 60);
+        if (++rounds % 12 == 5) {
+            // Every minute from 25 s: what each thread has been calling (a
+            // title spinning on something that never comes; call trace
+            // builds only).
+            for (GuestThread* t = all_threads; t; t = t->next) {
+                dump_calls(t, 40);
+                profile_calls(t, 8);
+            }
         }
         if (rounds % 12 != 1)
             continue;
-        for (GuestThread* t = all_threads; t; t = t->next)
+        for (GuestThread* t = all_threads; t; t = t->next) {
             if (t->import)
-                log("watchdog: thread %u (start %08X) %s %s, called from host %p\n", t->id, t->start,
-                    t->in_import ? "in" : "last called", t->import, t->import_caller);
+                log("watchdog: thread %u (start %08X) %s %s, called from host %p, %u KB of host stack\n", t->id,
+                    t->start, t->in_import ? "in" : "last called", t->import, t->import_caller,
+                    t->host_stack_top && t->host_stack_low < t->host_stack_top
+                        ? unsigned((t->host_stack_top - t->host_stack_low) >> 10)
+                        : 0u);
+        }
     }
 }
 
@@ -140,6 +149,7 @@ void mark_exited(GuestThread* t, uint32_t status) {
 DWORD WINAPI thread_entry(void* parameter) {
     guest::GuestFaults faults;
     GuestThread* thread = static_cast<GuestThread*>(parameter);
+    thread->host_stack_top = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
     this_thread = thread;
     PPCContext& ctx = thread->ctx;
     ctx.fpscr.csr = ctx.fpscr.getcsr();
@@ -463,6 +473,27 @@ void dump_calls(GuestThread* t, uint32_t count) {
 #endif
 }
 
+void profile_calls(GuestThread* t, uint32_t top) {
+#ifdef PPC_CALL_TRACE
+    // The functions entered most often in the whole ring: where a busy
+    // thread spends its calls.
+    uint32_t end = t->ctx.trace_next, start = end > PPC_CALL_TRACE_SIZE ? end - PPC_CALL_TRACE_SIZE : 0;
+    std::map<const void*, uint32_t> counts;
+    for (uint32_t i = start; i < end; i++)
+        counts[t->ctx.trace[i & (PPC_CALL_TRACE_SIZE - 1)]]++;
+    std::vector<std::pair<uint32_t, const void*>> sorted;
+    for (auto& [at, n] : counts)
+        sorted.push_back({n, at});
+    std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    log("calls: thread %u profile of %u calls\n", t->id, end - start);
+    for (uint32_t i = 0; i < top && i < sorted.size(); i++)
+        log("calls: %p\ncalls:   (x%u)\n", sorted[i].second, sorted[i].first);
+#else
+    (void)t;
+    (void)top;
+#endif
+}
+
 GuestThread* create_thread(uint32_t stack_size, uint32_t xapi_startup, uint32_t start, uint32_t context) {
     GuestThread* t = guest_thread_state(stack_size, start);
     t->xapi_startup = xapi_startup;
@@ -680,6 +711,33 @@ IMPORT(KeTlsSetValue) {
     if (ctx.r3.u32 < 64)
         current_thread()->tls[ctx.r3.u32] = ctx.r4.u32;
     ctx.r3.u64 = ctx.r3.u32 < 64;
+}
+
+// --- time and I/O space ----------------------------------------------------------
+
+IMPORT(KeQuerySystemTime) {
+    // (time*): 100-nanosecond units since 1601
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    guest::store64(ctx.r3.u32, (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime);
+}
+
+IMPORT(RtlTimeToTimeFields) {
+    // (time*, TIME_FIELDS*: year, month, day, hour, minute, second,
+    // milliseconds, weekday, 16 bits each)
+    uint64_t t = guest::load64(ctx.r3.u32);
+    FILETIME time = {DWORD(t), DWORD(t >> 32)};
+    SYSTEMTIME s = {};
+    FileTimeToSystemTime(&time, &s);
+    const WORD fields[8] = {s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond, s.wMilliseconds, s.wDayOfWeek};
+    for (int i = 0; i < 8; i++)
+        guest::store16(ctx.r4.u32 + i * 2, fields[i]);
+}
+
+IMPORT(MmMapIoSpace) {
+    // (2, address, bytes, flags): titles map XMA contexts with it, and the
+    // address itself serves (Xenia's answer).
+    ctx.r3.u64 = ctx.r4.u32;
 }
 
 // --- events, semaphores, waits ---------------------------------------------------

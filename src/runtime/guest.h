@@ -20,9 +20,11 @@
 
 namespace guest {
 
-// From the GPU's writeback page (0x7F000000) and registers (0x7FC80000) up.
+// From the GPU's writeback page (0x7F000000) and registers (0x7FC80000) up:
+// 512 MB, as committing is lazy and the title commits far more than it uses
+// (it ran out of 256 MB of addresses with a few MB of memory left).
 constexpr uint32_t kWindowBase = 0x7F000000;
-constexpr uint32_t kWindowSize = 0x10000000;
+constexpr uint32_t kWindowSize = 0x20000000;
 constexpr uint32_t kPage = 0x1000;
 
 // base + guest address: the host address (PPCBase, ppc_context.h).
@@ -128,6 +130,9 @@ struct GuestThread {
     const char* import = nullptr;
     void* import_caller = nullptr;
     volatile bool in_import = false;
+    // Its host stack: the top, and the deepest an import was called from
+    // (how much of kGuestHostStack it needs, for the watchdog).
+    uintptr_t host_stack_top = 0, host_stack_low = ~uintptr_t(0);
     GuestThread* next = nullptr;  // all threads, for the watchdog
 };
 
@@ -140,6 +145,8 @@ GuestThread* guest_thread_state(uint32_t stack_size, uint32_t start);
 // Logs the last count recompiled functions the thread entered (with
 // PPC_CALL_TRACE; nothing without).
 void dump_calls(GuestThread* thread, uint32_t count);
+// Logs the top functions it entered most often of its last few thousand.
+void profile_calls(GuestThread* thread, uint32_t top);
 // Creates a guest thread (suspended: resume with ResumeThread).
 GuestThread* create_thread(uint32_t stack_size, uint32_t xapi_startup, uint32_t start, uint32_t context);
 
