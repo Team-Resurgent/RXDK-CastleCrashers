@@ -47,7 +47,8 @@ PATCHES: list[tuple[str, str, str, str]] = [
 # A spin loop's hint to the processor: a yield here (ppc_spin_yield).
 SPIN = "\t// db16cyc \n"
 
-SWITCH =re.compile(r"\tswitch \(ctx\.(r\d+)\.u64\) \{\n\tcase 0:\n\t\tgoto loc_([0-9A-F]+);")
+# The index register: in the context, or a local (non_argument_as_local).
+SWITCH = re.compile(r"\tswitch \(((?:ctx\.)?r\d+)\.u64\) \{\n\tcase 0:\n\t\tgoto loc_([0-9A-F]+);")
 UNREACHABLE = "\tdefault:\n\t\t__builtin_unreachable();"
 
 
@@ -57,8 +58,8 @@ def rewrite_switches(text: str) -> tuple[str, int]:
         end = text.index(UNREACHABLE, m.end())
         register, first = m.group(1), m.group(2)
         out.append(text[pos:m.start()])
-        out.append(text[m.start():end].replace(f"ctx.{register}.u64", f"ctx.{register}.u32", 1))
-        out.append(f"\tdefault:\n\t\tppc_bad_switch(0x{first}, ctx.{register}.u32);")
+        out.append(text[m.start():end].replace(f"{register}.u64", f"{register}.u32", 1))
+        out.append(f"\tdefault:\n\t\tppc_bad_switch(0x{first}, {register}.u32);")
         pos = end + len(UNREACHABLE)
         count += 1
     out.append(text[pos:])

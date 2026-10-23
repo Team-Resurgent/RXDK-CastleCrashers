@@ -60,14 +60,24 @@ def visual_studio() -> Path:
 
 
 def host_tools() -> None:
-    if (HOST / "xexprep.exe").exists() and (HOST / "XenonRecomp/XenonRecomp/XenonRecomp.exe").exists():
+    patch = ROOT / "tools/xenonrecomp/recompiler.patch"
+    recomp = HOST / "XenonRecomp/XenonRecomp/XenonRecomp.exe"
+    # Built before the patch last changed: the patch again, and rebuilt (an
+    # older recompiler ignores context_register_functions, and its output
+    # crashes).
+    stale = recomp.exists() and recomp.stat().st_mtime < patch.stat().st_mtime
+    if (HOST / "xexprep.exe").exists() and recomp.exists() and not stale:
         return
     if not (XENONRECOMP / "CMakeLists.txt").exists():
         run(["git", "clone", "--recursive", XENONRECOMP_URL, XENONRECOMP])
         run(["git", "-C", XENONRECOMP, "checkout", XENONRECOMP_COMMIT])
         run(["git", "-C", XENONRECOMP, "submodule", "update", "--init", "--recursive"])
-        # Instructions this commit does not handle (tools/xenonrecomp).
-        run(["git", "-C", XENONRECOMP, "apply", ROOT / "tools/xenonrecomp/recompiler.patch"])
+        stale = True
+    if stale:
+        # Instructions this commit does not handle, and the registers kept in
+        # locals per function (tools/xenonrecomp).
+        run(["git", "-C", XENONRECOMP, "checkout", "--", "XenonRecomp"])
+        run(["git", "-C", XENONRECOMP, "apply", patch])
     vs = visual_studio()
     ninja = vs / "Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
     vcvars = vs / "VC/Auxiliary/Build/vcvars64.bat"

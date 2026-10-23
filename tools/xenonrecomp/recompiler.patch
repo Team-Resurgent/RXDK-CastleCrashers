@@ -1,8 +1,45 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..a6e74ff 100644
+index fa91527..5cd989d 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -525,6 +525,7 @@ bool Recompiler::Recompile(
+@@ -268,6 +268,8 @@ bool Recompiler::Recompile(
+     // TODO: we could cache these formats in an array
+     auto r = [&](size_t index)
+         {
++            if (registersInContext)
++                return fmt::format("ctx.r{}", index);
+             if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) || 
+                 (config.nonVolatileRegistersAsLocalVariables && index >= 14))
+             {
+@@ -279,6 +281,8 @@ bool Recompiler::Recompile(
+ 
+     auto f = [&](size_t index)
+         {
++            if (registersInContext)
++                return fmt::format("ctx.f{}", index);
+             if ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
+                 (config.nonVolatileRegistersAsLocalVariables && index >= 14))
+             {
+@@ -290,6 +294,8 @@ bool Recompiler::Recompile(
+ 
+     auto v = [&](size_t index)
+         {
++            if (registersInContext || !config.vectorRegistersAsLocalVariables)
++                return fmt::format("ctx.v{}", index);
+             if ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+                 (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
+             {
+@@ -388,7 +394,8 @@ bool Recompiler::Recompile(
+ 
+                 if (targetSymbol != image.symbols.end() && targetSymbol->address == address && targetSymbol->type == Symbol_Function)
+                 {
+-                    if (config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
++                    if (config.nonVolatileRegistersAsLocalVariables && !registersInContext && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0) &&
++                        (config.vectorRegistersAsLocalVariables || targetSymbol->name.find("vmx") == std::string::npos))
+                     {
+                         // print nothing
+                     }
+@@ -525,6 +532,7 @@ bool Recompiler::Recompile(
  
      switch (id)
      {
@@ -10,7 +47,7 @@ index fa91527..a6e74ff 100644
      case PPC_INST_ADD:
          println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          if (strchr(insn.opcode->name, '.'))
-@@ -663,9 +664,8 @@ bool Recompiler::Recompile(
+@@ -663,9 +671,8 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_BDNZF:
@@ -21,7 +58,7 @@ index fa91527..a6e74ff 100644
          break;
  
      case PPC_INST_BEQ:
-@@ -1133,6 +1133,7 @@ bool Recompiler::Recompile(
+@@ -1133,6 +1140,7 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
          break;
  
@@ -29,3 +66,86 @@ index fa91527..a6e74ff 100644
      case PPC_INST_LVEWX:
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
+@@ -2284,6 +2292,7 @@ bool Recompiler::Recompile(
+ 
+ bool Recompiler::Recompile(const Function& fn)
+ {
++    registersInContext = config.contextRegisterFunctions.count(fn.base) != 0;
+     auto base = fn.base;
+     auto end = base + fn.size;
+     auto* data = (uint32_t*)image.Find(base);
+@@ -2522,9 +2531,9 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+             println("#define PPC_CONFIG_SKIP_MSR");      
+         if (config.crRegistersAsLocalVariables)
+             println("#define PPC_CONFIG_CR_AS_LOCAL");      
+-        if (config.nonArgumentRegistersAsLocalVariables)
++        if (config.nonArgumentRegistersAsLocalVariables && config.contextRegisterFunctions.empty())
+             println("#define PPC_CONFIG_NON_ARGUMENT_AS_LOCAL");   
+-        if (config.nonVolatileRegistersAsLocalVariables)
++        if (config.nonVolatileRegistersAsLocalVariables && config.contextRegisterFunctions.empty())
+             println("#define PPC_CONFIG_NON_VOLATILE_AS_LOCAL");
+ 
+         println("");
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..9262e57 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -34,6 +34,9 @@ struct Recompiler
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
++    // The function being recompiled keeps its registers in the context
++    // (config.contextRegisterFunctions).
++    bool registersInContext = false;
+ 
+     bool LoadConfig(const std::string_view& configFilePath);
+ 
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..3a7859c 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -26,6 +26,7 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+         crRegistersAsLocalVariables = main["cr_as_local"].value_or(false);
+         nonArgumentRegistersAsLocalVariables = main["non_argument_as_local"].value_or(false);
+         nonVolatileRegistersAsLocalVariables = main["non_volatile_as_local"].value_or(false);
++        vectorRegistersAsLocalVariables = main["vector_as_local"].value_or(true);
+ 
+         restGpr14Address = main["restgprlr_14_address"].value_or(0u);
+         saveGpr14Address = main["savegprlr_14_address"].value_or(0u);
+@@ -58,6 +59,12 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+             }
+         }
+ 
++        if (auto contextArray = main["context_register_functions"].as_array())
++        {
++            for (auto& address : *contextArray)
++                contextRegisterFunctions.emplace(*address.value<uint32_t>());
++        }
++
+         if (auto invalidArray = main["invalid_instructions"].as_array())
+         {
+             for (auto& instr : *invalidArray)
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..43d57ea 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -39,6 +39,9 @@ struct RecompilerConfig
+     bool crRegistersAsLocalVariables = false;
+     bool nonArgumentRegistersAsLocalVariables = false;
+     bool nonVolatileRegistersAsLocalVariables = false;
++    // With the two above: the vector registers too (else they stay in the
++    // context, and __savevmx/__restvmx are still called).
++    bool vectorRegistersAsLocalVariables = true;
+     uint32_t restGpr14Address = 0;
+     uint32_t saveGpr14Address = 0;
+     uint32_t restFpr14Address = 0;
+@@ -50,6 +53,9 @@ struct RecompilerConfig
+     uint32_t longJmpAddress = 0;
+     uint32_t setJmpAddress = 0;
+     std::unordered_map<uint32_t, uint32_t> functions;
++    // Functions whose would-be-local registers stay in the context (they read
++    // one their caller set, as __finally funclets read their parent's frame).
++    std::unordered_set<uint32_t> contextRegisterFunctions;
+     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
+     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
+ 
