@@ -3,6 +3,7 @@
 <p align="center"><b>The Xbox Live Arcade's Castle Crashers, statically recompiled for the original Xbox with the open RXDK SDK — runs in 64 MB, from your own copy of the game</b></p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/status-work%20in%20progress-orange.svg" alt="Status: work in progress">
   <a href="https://discord.gg/VcdSfajQGK"><img src="https://img.shields.io/badge/chat-on%20discord-7289da.svg?logo=discord" alt="Discord"></a>
 </p>
 
@@ -10,6 +11,10 @@
   <a href="https://ko-fi.com/J3J7L5UMN"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi"></a>
   <a href="https://www.patreon.com/teamresurgent"><img src="https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white" alt="Patreon"></a>
 </p>
+
+> **Work in progress.** The game boots and is playable, but it is not finished:
+> expect bugs, missing effects, slowdowns and changes from one commit to the
+> next. See [Status](#status) for where it stands.
 
 **RXDK-CastleCrashers** ports The Behemoth's *Castle Crashers* (Xbox Live
 Arcade, 2008) to the **original Xbox** by static recompilation. The title's
