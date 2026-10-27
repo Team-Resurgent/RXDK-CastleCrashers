@@ -31,22 +31,28 @@ update 2 (`TU_<...>`), which the build applies.
 
 ## Status
 
-Early work in progress.
+Work in progress: playable, not finished.
 
 - Title update 2 is applied to `default.xex` and the whole title
   recompiles (7,170 functions).
-- In xemu at 64 MB it runs its logos, legal screen, attract sequence and
-  title menu, drawn on the NV2A, and with a scripted controller
-  (`build/inputs.txt`) goes from the menu through the gameplay loading
-  (about two and a half minutes) and the character select into the first
-  level.
-- Sound and music play: each of the title's XMA voices on an APU voice of
-  its own, from sounds converted when the game is built. XAudio keeps its
-  voices' timing but its resamplers only advance their positions and its
-  mix is not heard; the voices' volume and pitch are not applied yet.
-- The title draws its vector art into textures on the processor at load
-  time; its spans and the packing into textures run as native code
-  (`src/runtime/title.cpp`), the same to the bit as the recompiled code.
+- It runs on a real console (tested on a development kit) and in xemu at
+  64 MB: logos, legal screen, attract sequence, menus, character select and
+  levels, drawn on the NV2A with the controller.
+- Speed: at the start of the first level about 36 fps on the console (51 in
+  xemu, whose processor is faster than the Pentium III). The recompiled code
+  keeps the PowerPC registers in locals, so the compiler holds them in the
+  processor's registers; the few hundred functions that need them in the
+  context are found by `tools/context_functions.py`. The title's vertex
+  shaders run as native code, and runs of sprites with the same state are
+  drawn together.
+- Sound and music play on the APU, each sound on a voice of its own, from
+  sounds converted when the game is built: XAudio's source voices play
+  their converted sound with the title's volume, pan, pitch and loops, and
+  XAudio itself mixes nothing.
+- The title draws its vector art into textures on the processor; its spans
+  and the packing into textures run as native code (`src/runtime/title.cpp`),
+  the same to the bit as the recompiled code. The art of some packs is drawn
+  when it is first needed rather than at load time.
 - Memory, aiming at a retail 64 MB console:
   - Guest memory is committed when it is touched: the title commits a 32 MB
     heap, a 6 MB arena per 360 hardware thread and a 16 MB GPU block, and
@@ -61,8 +67,11 @@ Early work in progress.
   - Textures not drawn for a few seconds are compressed back to that form.
   - The sounds' XMA data is given back as it is read (the converted sounds
     play instead), host stacks are 64 KB, and the game code is built with
-    -Os.
-  - At 64 MB (xemu, iND-BiOS) the first level runs with about 6 MB free.
+    -Os, but for the five generated files with its hottest code (-O2).
+- Known issues: loading is slow on a console; some effects (pixel shaders
+  such as glows and blurs) are not drawn; short audio gaps have been heard
+  on a console, cause not found yet. Only the first levels have been played
+  through.
 
 ## Building
 
@@ -88,15 +97,15 @@ with ffmpeg and stored as IMA ADPCM in `build/audio/Sounds.jpa` and
 | --- | --- |
 | Package extraction (STFS) | `tools/extract_package.py` |
 | Title update applied, memory image and import list from `default.xex` | `tools/xexprep` (uses XenonRecomp's XEX loader and patcher) |
-| Instructions the pinned XenonRecomp does not handle | `tools/xenonrecomp` (applied when it is cloned) |
+| Instructions the pinned XenonRecomp does not handle, and the registers in locals per function | `tools/xenonrecomp` (applied when it is cloned or changes), `tools/context_functions.py` |
 | Recompiler configuration: helper addresses, jump tables, function bounds | `config/`, `tools/find_jump_tables.py`, `tools/find_switch_funcs.py` |
 | Pentium III changes to the generated code | `src/ppc/ppc_context.h`, `src/ppc/ppc_xbox_simd.h`, `tools/postprocess.py` |
 | Guest memory: a 512 MB window at guest `0x7F000000`, committed as it is touched | `src/runtime/memory.cpp` |
 | Kernel: threads, objects and waits, memory, the loader's queries | `src/runtime/kernel.cpp` |
 | Files (`game:\` is the title's folder, `D:\`; `update:\` is `D:\update`) | `src/runtime/io.cpp` |
 | XAM: the controller, no Live profile, no system UI | `src/runtime/xam.cpp` |
-| The GPU: the title's command buffers drawn with Direct3D 8 | `src/runtime/gpu.cpp`, `src/gpu` |
-| Sound: XMA contexts played on APU voices from the converted sounds; XAudio on one thread | `tools/convert_audio.py`, `src/runtime/xma.cpp`, `src/runtime/audio.cpp`, `src/runtime/xaudio.cpp` |
+| The GPU: the title's command buffers drawn with Direct3D 8, its vertex shaders as native code | `src/runtime/gpu.cpp`, `src/gpu` |
+| Sound: XAudio's source voices played on APU voices from the converted sounds | `tools/convert_audio.py`, `src/runtime/xma.cpp`, `src/runtime/audio.cpp`, `src/runtime/xaudio.cpp` |
 | Imports not implemented yet: logging stubs | `tools/gen_stubs.py` |
 | Changes to the title itself: one job worker, polling that sleeps, native rasterizer spans and packing, rasterized textures handed to the renderer, spin loops that yield | `tools/postprocess.py` (`PATCHES`), `src/runtime/title.cpp` |
 
